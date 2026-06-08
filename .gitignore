@@ -1,0 +1,72 @@
+# ==============================
+# ResearchOS .gitignore
+# ==============================
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.whl
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# ----- Virtual Environments -----
+.venv/
+venv/
+env/
+ENV/
+
+# ----- Environment Variables -----
+.env
+.env.local
+.env.*.local
+
+# ----- Node / Frontend -----
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# ----- IDEs -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ----- Docker -----
+docker-compose.override.yml
+
+# ----- Database -----
+*.db
+*.sqlite3
+alembic/versions/*.pyc
+
+# ----- Logs -----
+logs/
+*.log
+
+# ----- OS -----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- Misc -----
+*.bak
+*.tmp
+scratch/

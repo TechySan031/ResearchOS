@@ -1,0 +1,159 @@
+###############################################################################
+# ResearchOS — Production Docker Compose Stack
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+###############################################################################
+
+services:
+  # ================================================================
+  # API — FastAPI backend (Gunicorn + Uvicorn workers)
+  # ================================================================
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: researchos-api
+    restart: always
+    env_file:
+      - .env.production
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+    networks:
+      - researchos-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ================================================================
+  # PostgreSQL 16 — primary relational database
+  # ================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: researchos-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-researchos}
+      POSTGRES_USER: ${POSTGRES_USER:-researchos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # Production tuning via env — override in .env.production as needed
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-researchos} -d ${POSTGRES_DB:-researchos}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    command:
+      - "postgres"
+      - "-c" 
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "effective_cache_size=512MB"
+      - "-c"
+      - "max_connections=100"
+      - "-c"
+      - "log_min_duration_statement=1000"
+    networks:
+      - researchos-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ================================================================
+  # Redis 7 — caching, pub/sub, rate limiting
+  # ================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: researchos-redis
+    restart: always
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+        --appendonly yes
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+        --save 60 10000
+        --requirepass ${REDIS_PASSWORD:-changeme}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 768M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    networks:
+      - researchos-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+# ==================================================================
+# Volumes — persistent, named volumes for data durability
+# ==================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ==================================================================
+# Networks — isolated bridge network for the stack
+# ==================================================================
+networks:
+  researchos-net:
+    driver: bridge
+    name: researchos-production

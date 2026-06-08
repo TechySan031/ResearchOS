@@ -1,0 +1,57 @@
+# ==================================
+# ResearchOS — .dockerignore
+# ==================================
+
+# --- Version control ---
+.git
+.gitignore
+
+# --- Python caches ---
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# --- Virtual environments ---
+.venv
+venv
+env
+
+# --- Testing ---
+tests/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Environment / Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Build artifacts ---
+*.egg-info/
+dist/
+build/
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Docker ---
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# --- Documentation ---
+*.md
+docs/
+LICENSE
