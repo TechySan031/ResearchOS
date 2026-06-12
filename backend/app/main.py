@@ -7,9 +7,11 @@ and router aggregation.
 
 from contextlib import asynccontextmanager
 
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, Request
+# pyrefly: ignore [missing-import]
 from fastapi.responses import JSONResponse
-
+from app.integrations.pinecone_client import PineconeManager
 from app.config import get_settings, validate_production_settings
 from app.utils.logging import configure_logging, get_logger
 from app.utils.metrics import setup_metrics
@@ -44,8 +46,17 @@ async def lifespan(app: FastAPI):
     # Initialize database tables
     await init_db()
     logger.info("database_initialized")
+    # Initialize Pinecone
+    try:
+        pinecone = PineconeManager()
+        await pinecone.init_index()
+        logger.info("pinecone_initialized")
+    except Exception as e:
+        logger.error(
+            "pinecone_init_failed",
+            error=str(e)
+        )
 
-    # Connect to Redis (graceful — won't crash if unavailable)
     redis_manager = RedisManager()
     await redis_manager.connect()
 
@@ -143,6 +154,7 @@ def create_app() -> FastAPI:
 
         # ── Database ──
         try:
+            # pyrefly: ignore [missing-import]
             from sqlalchemy import text as sa_text
 
             async with async_session_factory() as session:

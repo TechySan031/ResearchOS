@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from typing import Any
-
+import time
 from app.core.events import AgentEvent, get_event_bus
 from app.integrations.llm_client import LLMClient
 from app.utils.logging import get_logger
@@ -112,6 +112,8 @@ async def stream_llm_to_event_bus(
     """
 
     chunks: list[str] = []
+    start_ns = time.monotonic_ns()
+    first_token_seen = False
 
     try:
         async for token in llm.stream(
@@ -121,6 +123,22 @@ async def stream_llm_to_event_bus(
             temperature=temperature,
             max_tokens=max_tokens,
         ):
+            if not first_token_seen:
+                ttft_ms = (
+                    time.monotonic_ns() -start_ns
+                )/ 1_000_000    
+                first_token_seen = True
+
+                await publish_event(
+                    agent_name=agent_name,
+                    event_type="metric_recorded",
+                    project_id=project_id,
+                    data={
+                        "metric_type": "ttft_ms",
+                        "value":round(ttft_ms,2),
+                        "section":section,
+                    },
+                )
             chunks.append(token)
 
             await publish_event(

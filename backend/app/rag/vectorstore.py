@@ -54,6 +54,7 @@ class VectorStore:
 
     def __init__(self, pinecone: PineconeManager | None = None) -> None:
         self._pinecone = pinecone or PineconeManager()
+        self._initialized = False
 
     # ------------------------------------------------------------------
     # Indexing
@@ -128,25 +129,20 @@ class VectorStore:
         self,
         chunks_with_embeddings: list[dict[str, Any]],
     ) -> int:
-        """Index pre-assembled chunk+embedding dicts.
 
-        Each item must contain:
-        - ``id`` (str)
-        - ``values`` (list[float])
-        - ``metadata`` (dict)
+        if not self._initialized:
+            await self._pinecone.init_index()
+            self._initialized = True
 
-        Args:
-            chunks_with_embeddings: List of vector dicts.
-
-        Returns:
-            Number of vectors upserted.
-        """
         if not chunks_with_embeddings:
             return 0
-        count = await self._pinecone.upsert_vectors(chunks_with_embeddings)
-        logger.info("vectorstore.chunks_indexed", count=count)
-        return count
 
+        count = await self._pinecone.upsert_vectors(chunks_with_embeddings)
+
+        logger.info("vectorstore.chunks_indexed", count=count)
+
+        return count
+        
     # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------

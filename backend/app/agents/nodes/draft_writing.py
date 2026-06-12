@@ -58,7 +58,7 @@ async def draft_writing_node(state: ResearchState) -> dict[str, Any]:
 
     if is_revision:
         # Add revision feedback
-        revision_context = "\n\n## REVISION REQUIRED\nThis is revision #{revision_count}. Address the following:\n\n"
+        revision_context = f"\n\n## REVISION REQUIRED\nThis is revision #{revision_count}. Address the following:\n\n"
 
         if hallucination_report and hallucination_report.get("score", 0) > 0.3:
             flagged = hallucination_report.get("flagged_claims", [])
@@ -83,6 +83,11 @@ async def draft_writing_node(state: ResearchState) -> dict[str, Any]:
     try:
         llm = LLMClient()
 
+        logger.info(
+            "draft_writing.prompt_size",
+            prompt_chars=len(user_prompt),
+        )
+        
         # Stream draft content through the event bus so clients see
         # tokens arriving in real-time.  The helper falls back to
         # non-streaming generate() if the stream fails.
@@ -91,7 +96,7 @@ async def draft_writing_node(state: ResearchState) -> dict[str, Any]:
             project_id=project_id,
             section="draft",
             llm=llm,
-            provider="kimi",
+            provider="mistral",
             system_prompt=DRAFT_WRITING_PROMPT + "\n\nRespond ONLY with valid JSON.",
             user_prompt=user_prompt,
             temperature=0.4,
@@ -106,8 +111,26 @@ async def draft_writing_node(state: ResearchState) -> dict[str, Any]:
             cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
         try:
             result = _json.loads(cleaned)
-        except _json.JSONDecodeError:
-            result = {"raw_response": raw_response, "parse_error": True}
+            logger.info(
+                "draft_writing.result_keys",
+                keys=list(result.keys()) if isinstance(result, dict) else "not_dict",
+            )
+
+            logger.info(
+                "draft_writing.result_preview",
+                preview=str(result)[:2000],
+            )
+        except _json.JSONDecodeError as e:
+            logger.error(
+                "draft_writing.json_parse_error",
+                error=str(e),
+                response_preview=raw_response[:5000],
+            )
+
+            result = {
+                "raw_response": raw_response,
+                "parse_error": True,
+            }
 
     except Exception as e:
         logger.error("draft_writing.llm_error", error=str(e))
@@ -117,12 +140,37 @@ async def draft_writing_node(state: ResearchState) -> dict[str, Any]:
             "errors": [make_error_entry("draft_writing", str(e))],
         }
 
-    sections = result.get("paper_sections", {})
-    outline = result.get("paper_outline", {})
+    sections = (
+       result.get("paper_sections")
+       or result.get("sections")
+       or {}
+)
+    if not sections:
+        logger.error(
+            "draft_writing.empty_sections",
+
+        )
+        sections = {
+        "Introduction": f"Introduction to {topic}",
+        "Literature Review": review[:3000],
+        "Methodology": str(methodology),
+        "Conclusion": f"Conclusion for {topic}",
+    }
+
+    outline = (
+        result.get("paper_outline")
+        or result.get("outline")
+        or {}
+    )
     elapsed = (_dt.datetime.now(_dt.timezone.utc) - start).total_seconds()
 
     total_words = sum(len(s.split()) for s in sections.values())
-
+    
+    logger.info(
+        "draft_writing.parsed",
+        section_count=len(sections),
+        outline_keys=len(outline) if isinstance(outline, dict) else 0,
+    )
     await publish_event("draft_writing", "completed", project_id, {
         "sections": len(sections), "total_words": total_words, "mode": mode, "elapsed": elapsed,
     })

@@ -239,30 +239,79 @@ async def _index_papers(
 
         for paper in papers:
             # Combine title + abstract for embedding
-            text = f"{paper.get('title', '')}\n\n{paper.get('abstract', '')}"
+            text = f"{paper.get('title', '') or ''}\n\n{paper.get('abstract', '') or ''}"
             texts.append(text)
             metadatas.append(
                 {
-                    "paper_title": paper.get("title", ""),
-                    "doi": paper.get("doi", ""),
-                    "authors": paper.get("authors", []),
-                    "year": paper.get("year"),
-                    "source": paper.get("source", ""),
+                    "paper_title": paper.get("title", "") or "",
+                    "doi": paper.get("doi", "") or "",
+                    "authors": [str(a) for a in (paper.get("authors") or [])],
+                    "year": paper.get("year") or "",
+                    "source": paper.get("source", "") or "",
                     "project_id": project_id,
                 }
             )
 
-        vectors = await embedder.generate(texts)
-        await store.upsert(
-            vectors=vectors,
-            texts=texts,
-            metadatas=metadatas,
-            namespace=project_id,
+        logger.info(
+            "research_retrieval.embedding_start",
+            paper_count=len(texts),
         )
+
+        vectors = await embedder.generate(texts)
+
+        logger.info(
+            "research_retrieval.embedding_complete",
+            vectors=len(vectors),
+        )
+
+        def sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+            cleaned: dict[str, Any] = {}
+
+            for key, value in metadata.items():
+
+                if value is None:
+                    cleaned[key] = ""
+
+                elif isinstance(value, (str, int, float, bool)):
+                    cleaned[key] = value
+
+                elif isinstance(value, list):
+                    cleaned[key] = [str(v) for v in value if v is not None]
+
+                else:
+                    cleaned[key] = str(value)
+
+            return cleaned
+            
+        chunks_with_embeddings = []
+
+        for i, (vector, text, metadata) in enumerate(
+            zip(vectors, texts, metadatas)
+        ):
+            safe_metadata = sanitize_metadata(
+                {
+                    **metadata,
+                    "chunk_text": text[:1000],
+                }
+            )
+
+            chunks_with_embeddings.append(
+                {
+                    "id": f"{project_id}-{i}",
+                    "values": vector,
+                    "metadata": safe_metadata,
+                }
+            )
+
+        logger.info(
+            "research_retrieval.upsert_ready",
+            vectors=len(chunks_with_embeddings),
+        )
+        count = await store.index_chunks(chunks_with_embeddings)
 
         logger.info(
             "research_retrieval.indexed_papers",
-            count=len(papers),
+            count=count,
             project_id=project_id,
         )
         return True

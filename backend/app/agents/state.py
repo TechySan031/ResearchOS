@@ -11,6 +11,7 @@ from __future__ import annotations
 import operator
 from typing import Annotated, TypedDict
 
+# pyrefly: ignore [missing-import]
 from langgraph.graph.message import add_messages
 
 
@@ -84,6 +85,7 @@ class ResearchState(TypedDict, total=False):
 
     # ── Gap analysis ─────────────────────────────────────────────
     research_gaps: list[dict]
+    gap_analysis_completed: bool
 
     # ── Methodology ──────────────────────────────────────────────
     suggested_methodologies: list[dict]

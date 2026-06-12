@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import datetime as _dt
 from typing import Any
-
+import traceback
+# pyrefly: ignore [missing-import]
 from langgraph.graph import StateGraph, END
+# pyrefly: ignore [missing-import]
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.agents.state import ResearchState
@@ -40,7 +42,7 @@ from app.core.events import EventBus, AgentEvent
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
+import time
 
 # ── Build the compiled graph ────────────────────────────────────────────
 
@@ -160,6 +162,7 @@ async def run_workflow(
     Returns:
         The final ``ResearchState`` after the workflow completes.
     """
+    workflow_start_ns = time.monotonic_ns()
     logger.info(
         "workflow.start",
         topic=topic,
@@ -217,23 +220,35 @@ async def run_workflow(
             pass
 
         final_state = await graph.ainvoke(initial_state, config=config)
-
+        workflow_duration_ms = (
+            time.monotonic_ns() - workflow_start_ns
+        ) / 1_000_000
+        
         # Publish workflow completion event
         try:
             bus = EventBus()
+
+    
             await bus.publish(
                 AgentEvent(
-                    agent_name="supervisor",
-                    event_type="workflow_completed",
-                    project_id=project_id,
-                    data={
-                        "status": final_state.get("status"),
-                        "agents_executed": len(final_state.get("agent_history", [])),
-                    },
+                     agent_name="supervisor",
+                     event_type="workflow_completed",
+                     project_id=project_id,
+                     data={
+                           "status": final_state.get("status"),
+                           "agents_executed": len(
+                                      final_state.get("agent_history", [])
+                            ),
+                            "workflow_duration_ms": round(
+                                      workflow_duration_ms,
+                                           2,
+                            ),
+                        },
+                    )
                 )
-            )
+
         except Exception:
-            pass
+             pass
 
         logger.info(
             "workflow.complete",
@@ -248,5 +263,6 @@ async def run_workflow(
             "workflow.failed",
             project_id=project_id,
             error=str(exc),
+            traceback=traceback.format_exc(),
         )
         raise

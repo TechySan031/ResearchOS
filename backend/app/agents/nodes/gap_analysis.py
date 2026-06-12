@@ -38,6 +38,11 @@ async def gap_analysis_node(state: ResearchState) -> dict[str, Any]:
             temperature=0.3,
             max_tokens=4096,
         )
+        logger.info(
+            "gap_analysis.raw_result",
+            result=result
+            
+        )
     except Exception as e:
         logger.error("gap_analysis.llm_error", error=str(e))
         return {
@@ -48,6 +53,11 @@ async def gap_analysis_node(state: ResearchState) -> dict[str, Any]:
         }
 
     gaps = result.get("research_gaps", [])
+    logger.info(
+        "gap_analysis.gaps_count",
+        count=len(gaps)
+    )
+    print("\nGAPS COUNT=", len(gaps), "\n")
     elapsed = (_dt.datetime.now(_dt.timezone.utc) - start).total_seconds()
 
     await publish_event("gap_analysis", "completed", project_id, {"gap_count": len(gaps), "elapsed": elapsed})
@@ -55,6 +65,7 @@ async def gap_analysis_node(state: ResearchState) -> dict[str, Any]:
 
     return {
         "research_gaps": gaps,
+        "gap_analysis_completed": True, 
         "current_agent": "gap_analysis",
         "agent_history": [make_history_entry("gap_analysis", gap_count=len(gaps), elapsed=elapsed)],
         "status": "gaps_identified",

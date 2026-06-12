@@ -11,7 +11,9 @@ import uuid
 import datetime as _dt
 from typing import Sequence
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import select, update, delete, func
+# pyrefly: ignore [missing-import]
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError
@@ -46,6 +48,7 @@ class ProjectService:
                 id=str(uuid.uuid4()),
                 title=data.title,
                 description=data.description or "",
+                topic=data.topic,
                 owner_id=data.user_id,
                 status="created",
                 created_at=_dt.datetime.now(_dt.timezone.utc),

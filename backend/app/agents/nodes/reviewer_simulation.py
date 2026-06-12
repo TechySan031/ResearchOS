@@ -38,7 +38,7 @@ async def reviewer_simulation_node(state: ResearchState) -> dict[str, Any]:
     try:
         llm = LLMClient()
         result = await llm.generate_json(
-            provider="kimi",
+            provider="mistral",
             system_prompt=REVIEWER_PROMPT,
             user_prompt=user_prompt,
             temperature=0.4,

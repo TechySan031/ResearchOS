@@ -16,7 +16,9 @@ import asyncio
 import json
 from typing import AsyncGenerator
 
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Request
+# pyrefly: ignore [missing-import]
 from fastapi.responses import StreamingResponse
 
 from app.core.events import get_event_bus, AgentEvent
@@ -84,6 +86,7 @@ async def _sse_event_generator(
                 "agent_error",
                 "workflow_completed",
                 "workflow_failed",
+                "metric_recorded",
             ):
                 yield _format_sse(event.event_type, {
                     "agent": event.agent_name,

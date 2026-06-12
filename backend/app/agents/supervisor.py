@@ -101,7 +101,7 @@ def route(state: ResearchState) -> str:
         next_node = "citation_verification"
 
     # 4. Citations verified but no gap analysis
-    elif not research_gaps:
+    elif not research_gaps: 
         next_node = "gap_analysis"
 
     # 5. Gaps found but no methodology suggested

@@ -10,7 +10,7 @@ import asyncio
 import uuid
 import datetime as _dt
 from typing import Any
-
+import traceback
 from app.agents.graph import build_research_graph, run_workflow
 from app.core.events import EventBus, AgentEvent
 from app.core.exceptions import NotFoundError, WorkflowError
@@ -55,6 +55,11 @@ class ResearchService:
         """
         # Validate project exists
         project = await ProjectService.get_project(project_id)
+        topic = (
+           request.search_queries[0]
+           if getattr(request, "search_queries", None)
+           else project.topic or ""
+        )
 
         # Prevent duplicate workflows
         if project_id in _active_workflows:
@@ -71,15 +76,17 @@ class ResearchService:
         _active_workflows[project_id] = {
             "workflow_id": workflow_id,
             "project_id": project_id,
-            "topic": project.topic or "",
+            "topic": topic,
             "status": "running",
             "started_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "task": None,
             "cancel_event": asyncio.Event(),
         }
 
+
         # Update project status
         async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
             from sqlalchemy import select
 
             result = await session.execute(
@@ -112,8 +119,9 @@ class ResearchService:
         task = asyncio.create_task(
             _run_workflow_task(
                 workflow_id=workflow_id,
+
                 project_id=project_id,
-                topic=project.topic or "",
+                topic=topic,
                 user_preferences=getattr(request, "user_preferences", None) or {},
                 max_revisions=getattr(request, "max_revisions", 3),
                 format_style=getattr(request, "format_style", "ieee"),
@@ -125,7 +133,7 @@ class ResearchService:
             "research_service.started",
             project_id=project_id,
             workflow_id=workflow_id,
-            topic=project.topic or "",
+            topic=topic,
         )
         return workflow_id
 
@@ -293,6 +301,7 @@ class ResearchService:
 
         # Update project status
         async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
             from sqlalchemy import select
 
             result = await session.execute(
@@ -365,6 +374,7 @@ async def _run_workflow_task(
 
         # Update project status
         async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
             from sqlalchemy import select
 
             result = await session.execute(
@@ -373,7 +383,15 @@ async def _run_workflow_task(
             proj = result.scalar_one_or_none()
             if proj is not None:
                 proj.status = "completed"
+                proj.workflow_state = final_state
                 proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+
+                logger.info(
+                    "research_service.saving_workflow_state",
+                    project_id=project_id,
+                    keys=list(final_state.keys()),
+                )
+
                 await session.commit()
 
         try:
@@ -408,6 +426,7 @@ async def _run_workflow_task(
             workflow_id=workflow_id,
             project_id=project_id,
             error=str(exc),
+            traceback=traceback.format_exc(),
         )
 
         if project_id in _active_workflows:
@@ -419,6 +438,7 @@ async def _run_workflow_task(
         # Update project status
         try:
             async with get_async_session() as session:
+                # pyrefly: ignore [missing-import]
                 from sqlalchemy import select
 
                 result = await session.execute(

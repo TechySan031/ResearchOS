@@ -44,7 +44,7 @@ async def literature_review_node(state: ResearchState) -> dict[str, Any]:
     try:
         llm = LLMClient()
         result = await llm.generate_json(
-            provider="kimi",
+            provider="mistral",
             system_prompt=LITERATURE_REVIEW_PROMPT,
             user_prompt=user_prompt,
             temperature=0.3,
