@@ -1,0 +1,1 @@
+"""Copilot request/response schemas."""

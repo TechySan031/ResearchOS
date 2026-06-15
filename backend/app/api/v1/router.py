@@ -15,6 +15,7 @@ from app.api.v1.documents import router as documents_router
 from app.api.v1.citations import router as citations_router
 from app.api.v1.agents import router as agents_router
 from app.api.v1.streaming import router as streaming_router
+from app.api.v1.copilot import router as copilot_router
 
 
 v1_router = APIRouter()
@@ -59,6 +60,13 @@ v1_router.include_router(
     agents_router,
     prefix="/projects/{project_id}/agents",
     tags=["Agents"],
+)
+
+# ---- Copilot ----
+v1_router.include_router(
+    copilot_router,
+    prefix="/projects/{project_id}",
+    tags=["Copilot"],
 )
 
 # ---- WebSocket ----
