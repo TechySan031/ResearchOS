@@ -24,7 +24,7 @@ structlog>=24.4.0
 redis>=5.2.0
 
 # ----- Vector Store -----
-pinecone-client>=7.3.0
+pinecone>=7.3.0
 
 # ----- Embeddings -----
 sentence-transformers>=3.3.0
