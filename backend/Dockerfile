@@ -3,7 +3,7 @@
 ###############################################################################
 
 # ========================== Stage 1: Builder ==========================
-FROM python:3.13-slim AS builder
+FROM python:3.12-slim AS builder
 
 # Prevent Python from writing .pyc and enable unbuffered stdout/stderr
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -12,8 +12,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # System deps required to compile binary wheels (psycopg, numpy, etc.)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
+    build-essential \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a virtual-env so we can copy it cleanly into the runtime stage
@@ -28,10 +28,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 
 # ========================== Stage 2: Runtime ==========================
-FROM python:3.13-slim AS runtime
+FROM python:3.12-slim AS runtime
 
 LABEL maintainer="ResearchOS Team" \
-      description="ResearchOS FastAPI backend — production image"
+    description="ResearchOS FastAPI backend — production image"
 
 # Runtime ENV
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -43,8 +43,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install only the minimal runtime libraries (libpq for asyncpg)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libpq5 \
-        curl \
+    libpq5 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
