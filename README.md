@@ -2,26 +2,91 @@
 
 # 🔬 ResearchOS
 
-### AI Research Operating System
+### Production-Grade Multi-Agent AI Research Automation Platform
 
-*A production-grade, multi-agent research workflow automation platform*
+*Powered by LangGraph • Retrieval-Augmented Generation • FastAPI • Next.js • PostgreSQL*
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Next.js](https://img.shields.io/badge/Next.js-15+-000000?logo=next.js&logoColor=white)](https://nextjs.org)
-[![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-1C3C3C?logo=langchain&logoColor=white)](https://langchain-ai.github.io/langgraph/)
+[![Next.js](https://img.shields.io/badge/Next.js-15-black?logo=next.js)](https://nextjs.org)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Agent%20Orchestration-blue)](https://langchain-ai.github.io/langgraph/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Supabase-4169E1?logo=postgresql&logoColor=white)](https://supabase.com/)
+[![Pinecone](https://img.shields.io/badge/Pinecone-Vector%20Database-00B388)](https://www.pinecone.io/)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![License](https://img.shields.io/badge/License-MIT-success)](LICENSE)
 
 </div>
 
 ---
 
+# Table of Contents
+
+- Overview
+- Why ResearchOS?
+- Features
+- Architecture
+- Tech Stack
+- Multi-Agent System
+- Project Structure
+- Installation
+- Deployment
+- API
+- Roadmap
+- License
+
+---
+
 ## Overview
 
-ResearchOS is an **AI-powered research operating system** that automates the complete lifecycle of academic paper creation — from literature discovery to publication-ready output.
+ResearchOS is a **production-grade multi-agent AI platform that automates the end-to-end academic research lifecycle—from literature discovery to publication-ready manuscripts—using deterministic workflow orchestration, Retrieval-Augmented Generation (RAG), and specialized AI agents.** 
 
 Unlike simple chatbot wrappers, ResearchOS orchestrates **12 specialized AI agents** through a deterministic supervisor architecture, backed by **real RAG pipelines** with citation grounding, hallucination detection, and verification loops.
 
-### What It Does
+---
+
+## Project Status
+
+> 🚧 **Actively Developed**
+
+| Component | Status |
+|------------|--------|
+| Multi-Agent Workflow | ✅ Complete |
+| RAG Pipeline | ✅ Complete |
+| Authentication | ✅ Complete |
+| PostgreSQL Migration | ✅ Complete |
+| Streaming (WebSocket/SSE) | ✅ Complete |
+| Docker Support | ✅ Complete |
+| Production Deployment | 🚀 In Progress |
+
+---
+
+## Why This Project Stands Out
+
+- 🚀 12-agent deterministic workflow built with LangGraph
+- 📚 Retrieval-Augmented Generation using Pinecone
+- 🔎 Citation verification and hallucination detection
+- ⚡ Real-time workflow visualization with WebSockets
+- 🔐 JWT authentication and audit logging
+- 🐳 Dockerized production deployment
+- ☁️ Railway + Vercel + Supabase architecture
+
+---
+
+## Why ResearchOS?
+
+Most AI research assistants are prompt-based chatbots that struggle with:
+
+- Long-running research workflows
+- Citation grounding
+- Hallucination control
+- Multi-step reasoning
+- Workflow reproducibility
+
+ResearchOS addresses these limitations through deterministic workflow orchestration, Retrieval-Augmented Generation (RAG), specialized AI agents, real-time execution monitoring, and production-grade infrastructure.
+
+---
+
+### Key Capabilities
 
 1. 📚 **Retrieves** relevant papers from arXiv, Semantic Scholar, and CrossRef
 2. 🧠 **Builds** a semantic knowledge base using embeddings + Pinecone vector DB
@@ -65,6 +130,18 @@ Unlike simple chatbot wrappers, ResearchOS orchestrates **12 specialized AI agen
 
 ---
 
+## System Components
+
+ResearchOS is composed of five primary layers:
+
+- **Frontend** – Next.js workspace for managing research projects.
+- **API Layer** – FastAPI REST APIs, WebSockets and middleware.
+- **Workflow Engine** – LangGraph supervisor orchestrating specialized AI agents.
+- **Knowledge Layer** – Pinecone vector database with Retrieval-Augmented Generation (RAG).
+- **Persistence Layer** – PostgreSQL (Supabase) storing users, projects, workflows, and audit logs.
+
+---
+
 ## Tech Stack
 
 | Layer | Technology |
@@ -74,10 +151,49 @@ Unlike simple chatbot wrappers, ResearchOS orchestrates **12 specialized AI agen
 | AI Orchestration | LangGraph (supervisor pattern) |
 | Vector Database | Pinecone (serverless) |
 | Embeddings | BAAI/bge-large-en-v1.5 |
-| LLMs | Mistral (structured gen), Kimi (long context) |
+| LLMs | Mistral Large, Kimi (long context) |
 | Caching | Redis |
-| Database | SQLite (dev) / PostgreSQL (prod) |
+| Database | PostgreSQL (Supabase) |
 | Research APIs | arXiv, Semantic Scholar, CrossRef |
+
+---
+
+## Production Features
+
+| Feature | Description |
+|----------|-------------|
+| JWT Authentication | Secure access & refresh tokens |
+| PostgreSQL | Persistent relational storage |
+| Pinecone | Semantic vector search |
+| Redis | Caching & pub/sub |
+| WebSockets | Live workflow updates |
+| SSE | Streaming responses |
+| Docker | Containerized deployment |
+| Gunicorn | Production ASGI server |
+| Health Checks | Readiness & liveness endpoints |
+| Audit Logging | User action tracking |
+
+---
+
+## Authentication
+
+ResearchOS uses JWT-based authentication with:
+
+- Email/password sign-up
+
+- Email verification
+
+- Password reset
+
+- Short-lived access tokens
+
+- Refresh token support
+
+- Secure password hashing
+
+- JWT authentication
+
+- Role-based authorization
 
 ---
 
@@ -94,7 +210,7 @@ Unlike simple chatbot wrappers, ResearchOS orchestrates **12 specialized AI agen
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/ResearchOS.git
+git clone https://github.com/TechySan031/ResearchOS.git
 cd ResearchOS
 
 # Copy environment variables
@@ -155,6 +271,20 @@ ResearchOS/
 
 ---
 
+### backend/
+
+FastAPI backend containing the LangGraph workflow engine, AI agents, REST APIs, WebSocket services, authentication, persistence layer, and integrations.
+
+### frontend/
+
+Next.js application providing the ResearchOS dashboard, research workspace, workflow visualization, and document editor.
+
+### docs/
+
+Architecture diagrams, screenshots, documentation, and deployment assets.
+
+---
+
 ## Multi-Agent System
 
 ResearchOS uses a **deterministic supervisor pattern** — the supervisor routes tasks based on workflow state, not LLM decisions. This ensures auditable, reproducible research workflows.
@@ -178,10 +308,15 @@ ResearchOS uses a **deterministic supervisor pattern** — the supervisor routes
 
 ## API Documentation
 
-Once the backend is running, access the interactive API docs at:
+After starting the backend:
 
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+| Documentation | URL |
+|--------------|-----|
+| Swagger UI | http://localhost:8000/docs |
+| ReDoc | http://localhost:8000/redoc |
+| Health Check | http://localhost:8000/api/v1/health |
+
+> Production URLs will be added after deployment.
 
 ---
 
@@ -204,6 +339,71 @@ make db-upgrade
 
 ---
 
+
+## Deployment
+
+ResearchOS is designed for cloud-native deployment.
+
+| Component | Technology | Platform |
+|-----------|------------|----------|
+| Frontend | Next.js | Vercel |
+| Backend | FastAPI | Railway |
+| Database | PostgreSQL | Supabase |
+| Vector Database | Pinecone | Serverless |
+| Cache | Redis | Railway |
+
+---
+
+## Roadmap
+
+### Completed
+
+- ✅ LangGraph Supervisor
+- ✅ 12-Agent Workflow
+- ✅ Pinecone Integration
+- ✅ PostgreSQL Migration
+- ✅ JWT Authentication
+- ✅ Audit Logging
+- ✅ WebSockets
+- ✅ Docker Support
+
+### Upcoming
+
+- 📈 Observability Dashboard
+- 🤖 MCP Integration
+- 🧠 Local LLM Support
+- ☸ Kubernetes Deployment
+- 🎥 Live Demo
+
+---
+
+## Future Improvements
+
+- Multi-user collaboration
+- Knowledge graph generation
+- Citation network visualization
+- PDF annotation workspace
+- Local LLM support (Ollama)
+- Kubernetes deployment
+- Distributed agent execution
+
+---
+
+## Engineering Principles
+
+ResearchOS is designed around production software engineering principles:
+
+- Modular architecture
+- Asynchronous execution
+- Deterministic agent orchestration
+- Type-safe APIs
+- Scalable service layer
+- Secure authentication
+- Cloud-native deployment
+- Extensible workflow design
+
+---
+
 ## License
 
 MIT
@@ -211,5 +411,13 @@ MIT
 ---
 
 <div align="center">
-<sub>Built with ❤️ for the research community</sub>
+
+### ResearchOS
+
+Production-grade Multi-Agent AI Research Automation Platform
+
+Designed and engineered using modern AI infrastructure, cloud-native architecture, and scalable software engineering practices.
+
+⭐ If you found this project interesting, consider giving it a star!
+
 </div>
