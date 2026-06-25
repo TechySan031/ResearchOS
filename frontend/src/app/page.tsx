@@ -27,9 +27,13 @@ export default function Dashboard() {
   const [description, setDescription] = useState('');
   const [formatStyle, setFormatStyle] = useState('ieee');
 
+  const { isAuthenticated } = useAuthStore();
+
   useEffect(() => {
-    fetchProjects();
-  }, [fetchProjects]);
+    if (isAuthenticated) {
+      fetchProjects();
+    }
+  }, [isAuthenticated, fetchProjects]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

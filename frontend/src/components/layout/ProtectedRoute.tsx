@@ -20,8 +20,12 @@ export default function ProtectedRoute({ children, requiredRole }: ProtectedRout
   const [initialized, setInitialized] = useState(false);
 
   useEffect(() => {
-    initialize();
-    setInitialized(true);
+    const init = async () => {
+      await initialize();
+      setInitialized(true);
+    };
+
+    init();
   }, [initialize]);
 
   useEffect(() => {

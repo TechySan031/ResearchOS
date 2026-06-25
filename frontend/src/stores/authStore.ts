@@ -76,7 +76,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   isLoading: false,
   error: null,
 
-  initialize: () => {
+  initialize: async () => {
     const { access, refresh } = loadTokens();
     if (access && refresh) {
       set({
