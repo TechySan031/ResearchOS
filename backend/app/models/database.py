@@ -296,6 +296,10 @@ class DocumentSectionModel(Base):
 
 # ── Engine & Session Factory ─────────────────────────────────────────────────
 
+print("=" * 80)
+print("DATABASE URL:", settings.database_url)
+print("=" * 80)
+
 _engine = create_async_engine(
     settings.database_url,
     echo=settings.app_debug,
