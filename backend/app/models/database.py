@@ -20,7 +20,7 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.sqlite import JSON as SQLiteJSON
+from sqlalchemy import JSON
 from sqlalchemy.ext.asyncio import (
     AsyncAttrs,
     AsyncSession,
@@ -43,7 +43,7 @@ class Base(AsyncAttrs, DeclarativeBase):
     """Application-wide declarative base for all ORM models."""
 
     type_annotation_map = {
-        dict[str, Any]: SQLiteJSON,
+        dict[str, Any]: JSON,
     }
 
 
@@ -72,6 +72,9 @@ class UserModel(Base):
     hashed_password: Mapped[Optional[str]] = mapped_column(
         String(512), nullable=True,
     )
+    role: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="researcher", index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(),
     )
@@ -83,9 +86,12 @@ class UserModel(Base):
     projects: Mapped[list["ProjectModel"]] = relationship(
         back_populates="owner", cascade="all, delete-orphan",
     )
+    audit_logs: Mapped[list["AuditLogModel"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
-        return f"<User id={self.id!r} email={self.email!r}>"
+        return f"<User id={self.id!r} email={self.email!r} role={self.role!r}>"
 
 
 # ── Project ──────────────────────────────────────────────────────────────────
@@ -106,10 +112,10 @@ class ProjectModel(Base):
         String(32), nullable=False, default="created", index=True,
     )
     workflow_state: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        SQLiteJSON, nullable=True,
+        JSON, nullable=True,
     )
     settings_json: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        "settings", SQLiteJSON, nullable=True,
+        "settings", JSON, nullable=True,
     )
     owner_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=False, index=True,
@@ -157,7 +163,7 @@ class PaperModel(Base):
     title: Mapped[str] = mapped_column(String(1024), nullable=False)
     abstract: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     authors: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        SQLiteJSON, nullable=True,
+        JSON, nullable=True,
     )
     doi: Mapped[Optional[str]] = mapped_column(
         String(256), nullable=True, index=True,
@@ -166,7 +172,7 @@ class PaperModel(Base):
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     metadata_json: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        "metadata", SQLiteJSON, nullable=True,
+        "metadata", JSON, nullable=True,
     )
     full_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -206,7 +212,7 @@ class CitationModel(Base):
         String(32), nullable=False, default="unverified",
     )
     verification_details: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        SQLiteJSON, nullable=True,
+        JSON, nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(),
@@ -238,7 +244,7 @@ class AgentLogModel(Base):
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
     message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     data: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        SQLiteJSON, nullable=True,
+        JSON, nullable=True,
     )
     tokens_used: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -333,6 +339,47 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
+# ── Audit Log ────────────────────────────────────────────────────────────────
+
+
+class AuditLogModel(Base):
+    """Immutable audit trail entry for security-relevant events."""
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_uuid,
+    )
+    user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True, index=True,
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    resource_type: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+    )
+    resource_id: Mapped[Optional[str]] = mapped_column(
+        String(36), nullable=True, index=True,
+    )
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[Optional[str]] = mapped_column(
+        String(45), nullable=True,
+    )
+    user_agent: Mapped[Optional[str]] = mapped_column(
+        String(512), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+    # Relationships
+    user: Mapped[Optional["UserModel"]] = relationship(
+        back_populates="audit_logs",
+    )
+
+    def __repr__(self) -> str:
+        return f"<AuditLog id={self.id!r} action={self.action!r}>"
+
+
 # ── Convenience aliases ──────────────────────────────────────────────────────
 # Short names so services can use `from app.models.database import Project`
 
@@ -342,3 +389,4 @@ User = UserModel
 Citation = CitationModel
 AgentLog = AgentLogModel
 DocumentSection = DocumentSectionModel
+AuditLog = AuditLogModel

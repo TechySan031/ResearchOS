@@ -51,6 +51,36 @@ ACTIVE_WORKFLOWS = Gauge(
     "Number of research workflows currently in progress.",
 )
 
+# ── Auth Metrics ─────────────────────────────────────────────────────────────
+
+AUTH_ATTEMPTS = Counter(
+    "researchos_auth_attempts_total",
+    "Total authentication attempts.",
+    labelnames=["operation", "result"],
+)
+
+# ── Copilot Metrics ──────────────────────────────────────────────────────────
+
+COPILOT_REQUESTS = Counter(
+    "researchos_copilot_requests_total",
+    "Total copilot chat requests.",
+    labelnames=["project_id"],
+)
+
+COPILOT_LATENCY = Histogram(
+    "researchos_copilot_duration_seconds",
+    "Copilot response latency in seconds.",
+    buckets=(0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
+)
+
+# ── Workflow Lifecycle Metrics ───────────────────────────────────────────────
+
+WORKFLOW_LIFECYCLE = Counter(
+    "researchos_workflow_lifecycle_total",
+    "Workflow lifecycle events.",
+    labelnames=["event"],
+)
+
 
 def setup_metrics() -> None:
     """Perform any one-time metrics initialisation.

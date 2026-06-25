@@ -383,6 +383,12 @@ async def _run_workflow_task(
             proj = result.scalar_one_or_none()
             if proj is not None:
                 proj.status = "completed"
+
+                logger.info(
+                    "final_state_type",
+                    type=str(type(final_state)),
+                )
+                
                 proj.workflow_state = final_state
                 proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
 
@@ -392,8 +398,40 @@ async def _run_workflow_task(
                     keys=list(final_state.keys()),
                 )
 
-                await session.commit()
+                sections = final_state.get("paper_sections", {})
 
+                if sections:
+                    from sqlalchemy import delete
+                    from app.models.database import DocumentSection
+
+                    await session.execute(
+                        delete(DocumentSection).where(
+                            DocumentSection.project_id == project_id
+                        )
+                    )
+
+                    for order, (title, content) in enumerate(sections.items()):
+                        session.add(
+                            DocumentSection(
+                                project_id=project_id,
+                                title=title,
+                                content=content,
+                section_order=order,
+                section_type=title.lower().replace(" ", "_"),
+                word_count=len(content.split()) if content else 0,
+            )
+        )
+
+        logger.info(
+            "research_service.saved_document_sections",
+            project_id=project_id,
+            section_count=len(sections),
+        )
+
+
+        await session.commit()
+
+            
         try:
             bus = EventBus()
             await bus.publish(

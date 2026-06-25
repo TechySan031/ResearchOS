@@ -141,7 +141,7 @@ async def _search_arxiv(query: str, max_results: int) -> list[dict[str, Any]]:
             )
         return results
     except Exception as exc:
-        logger.error("research_retrieval.arxiv_error", error=str(exc), query=query)
+        logger.error(".arxiv_error", error=str(exc), query=query)
         return []
 
 
@@ -173,7 +173,7 @@ async def _search_semantic_scholar(
         return results
     except Exception as exc:
         logger.error(
-            "research_retrieval.semantic_scholar_error",
+            ".semantic_scholar_error",
             error=str(exc),
             query=query,
         )
@@ -212,7 +212,7 @@ async def _search_crossref(query: str, max_results: int) -> list[dict[str, Any]]
         return results
     except Exception as exc:
         logger.error(
-            "research_retrieval.crossref_error", error=str(exc), query=query
+            ".crossref_error", error=str(exc), query=query
         )
         return []
 
@@ -253,14 +253,14 @@ async def _index_papers(
             )
 
         logger.info(
-            "research_retrieval.embedding_start",
+            ".embedding_start",
             paper_count=len(texts),
         )
 
         vectors = await embedder.generate(texts)
 
         logger.info(
-            "research_retrieval.embedding_complete",
+            ".embedding_complete",
             vectors=len(vectors),
         )
 
@@ -304,13 +304,13 @@ async def _index_papers(
             )
 
         logger.info(
-            "research_retrieval.upsert_ready",
+            ".upsert_ready",
             vectors=len(chunks_with_embeddings),
         )
         count = await store.index_chunks(chunks_with_embeddings)
 
         logger.info(
-            "research_retrieval.indexed_papers",
+            ".indexed_papers",
             count=count,
             project_id=project_id,
         )
@@ -318,7 +318,7 @@ async def _index_papers(
 
     except Exception as exc:
         logger.error(
-            "research_retrieval.index_error",
+            ".index_error",
             error=str(exc),
             project_id=project_id,
         )
@@ -328,7 +328,7 @@ async def _index_papers(
 # ── Main node function ──────────────────────────────────────────────────
 
 
-async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
+async def _node(state: ResearchState) -> dict[str, Any]:
     """LangGraph node: retrieve and index academic papers.
 
     Args:
@@ -344,7 +344,7 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
     start_time = _dt.datetime.now(_dt.timezone.utc)
 
     logger.info(
-        "research_retrieval.start",
+        ".start",
         topic=topic,
         project_id=project_id,
     )
@@ -355,19 +355,19 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
         await event_bus.publish(
             AgentEvent(
                 agent_name="research_retrieval",
-                event_type="started",
+                event_type="agent_started",
                 project_id=project_id,
                 data={"topic": topic},
             )
         )
     except Exception:
-        logger.warning("research_retrieval.event_publish_failed")
+        logger.warning(".event_publish_failed")
 
     errors: list[dict[str, Any]] = []
 
     # 1. Generate search queries
     queries = _generate_queries(topic)
-    logger.info("research_retrieval.queries", queries=queries)
+    logger.info(".queries", queries=queries)
 
     # 2. Search all sources in parallel for each query
     per_query_limit = 15
@@ -385,7 +385,7 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
         if isinstance(result, BaseException):
             errors.append(
                 {
-                    "agent": "research_retrieval",
+                    "agent": "",
                     "error": str(result),
                     "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
                 }
@@ -395,14 +395,14 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
             all_papers.extend(result)
 
     logger.info(
-        "research_retrieval.raw_count",
+        ".raw_count",
         raw_count=len(all_papers),
     )
 
     # 3. Deduplicate
     unique_papers = _deduplicate_papers(all_papers)
     logger.info(
-        "research_retrieval.dedup_count",
+        ".dedup_count",
         dedup_count=len(unique_papers),
     )
 
@@ -420,7 +420,7 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
         await event_bus.publish(
             AgentEvent(
                 agent_name="research_retrieval",
-                event_type="completed",
+                event_type="agent_completed",
                 project_id=project_id,
                 data={
                     "paper_count": len(ranked_papers),
@@ -430,10 +430,10 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
             )
         )
     except Exception:
-        logger.warning("research_retrieval.event_publish_failed")
+        logger.warning(".event_publish_failed")
 
     logger.info(
-        "research_retrieval.complete",
+        ".complete",
         paper_count=len(ranked_papers),
         embeddings_stored=embeddings_stored,
         elapsed_seconds=elapsed,
@@ -442,10 +442,10 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
     return {
         "retrieved_papers": ranked_papers,
         "paper_embeddings_stored": embeddings_stored,
-        "current_agent": "research_retrieval",
+        "current_agent": "",
         "agent_history": [
             {
-                "agent": "research_retrieval",
+                "agent": "",
                 "status": "completed",
                 "paper_count": len(ranked_papers),
                 "queries_used": queries,
@@ -456,3 +456,7 @@ async def research_retrieval_node(state: ResearchState) -> dict[str, Any]:
         "errors": errors,
         "status": "papers_retrieved",
     }
+
+# LangGraph export
+research_retrieval_node = _node
+    

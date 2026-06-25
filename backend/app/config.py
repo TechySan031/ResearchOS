@@ -70,10 +70,20 @@ class Settings(BaseSettings):
     # ── CORS ─────────────────────────────────────────────────────────────
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:8000"]
 
-    # ── JWT Auth (Phase 6) ───────────────────────────────────────────────
+    # ── JWT Auth ───────────────────────────────────────────────────────────
     jwt_secret_key: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = 30
+    jwt_refresh_expiration_days: int = 7
+
+    # ── Per-Endpoint Rate Limits (requests per minute) ────────────────────
+    rate_limit_auth_per_minute: int = 20
+    rate_limit_workflow_per_minute: int = 10
+    rate_limit_copilot_per_minute: int = 30
+    rate_limit_project_create_per_minute: int = 10
+
+    # ── Security ─────────────────────────────────────────────────────────
+    max_request_size_bytes: int = 10 * 1024 * 1024  # 10 MB
 
     # ── Validators ───────────────────────────────────────────────────────
 

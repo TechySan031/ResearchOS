@@ -20,6 +20,7 @@ from app.integrations.redis_client import RedisManager
 from app.api.middleware.cors import add_cors_middleware
 from app.api.middleware.rate_limiter import RateLimiterMiddleware
 from app.api.middleware.request_logging import RequestLoggingMiddleware
+from app.api.middleware.security_headers import SecurityHeadersMiddleware
 from app.api.middleware.error_handler import add_exception_handlers
 
 
@@ -106,6 +107,9 @@ def create_app() -> FastAPI:
     # Request logging (outermost — captures full request lifecycle)
     app.add_middleware(RequestLoggingMiddleware)
 
+    # Security headers
+    app.add_middleware(SecurityHeadersMiddleware)
+
     # Rate limiting
     app.add_middleware(
         RateLimiterMiddleware,
@@ -132,7 +136,7 @@ def create_app() -> FastAPI:
             "version": "0.1.0",
             "description": "AI Research Operating System",
             "docs": "/docs",
-            "health": "/health",
+            "health": "/api/v1/health",
             "api": "/api/v1",
         }
 

@@ -6,6 +6,34 @@ from enum import StrEnum, unique
 
 
 @unique
+class UserRole(StrEnum):
+    """Roles for RBAC."""
+
+    ADMIN = "admin"
+    RESEARCHER = "researcher"
+    VIEWER = "viewer"
+
+
+@unique
+class AuditAction(StrEnum):
+    """Actions recorded in the audit log."""
+
+    USER_REGISTERED = "user_registered"
+    USER_LOGIN = "user_login"
+    USER_LOGOUT = "user_logout"
+    TOKEN_REFRESHED = "token_refreshed"
+    PROJECT_CREATED = "project_created"
+    PROJECT_UPDATED = "project_updated"
+    PROJECT_DELETED = "project_deleted"
+    WORKFLOW_STARTED = "workflow_started"
+    WORKFLOW_PAUSED = "workflow_paused"
+    WORKFLOW_RESUMED = "workflow_resumed"
+    WORKFLOW_CANCELLED = "workflow_cancelled"
+    EXPORT_REQUESTED = "export_requested"
+    COPILOT_CHAT = "copilot_chat"
+
+
+@unique
 class WorkflowStatus(StrEnum):
     """High-level statuses a research workflow can transition through."""
 

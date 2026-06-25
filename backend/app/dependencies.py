@@ -2,7 +2,7 @@
 ResearchOS — Dependency Injection
 
 FastAPI dependency functions for database sessions, Redis clients,
-and configuration access.
+configuration access, and authentication.
 """
 
 from typing import AsyncGenerator
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings, get_settings
 from app.models.database import get_async_session
 from app.integrations.redis_client import RedisManager
+from app.core.security import CurrentUser, get_current_user  # noqa: F401
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

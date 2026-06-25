@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Generic, List, Optional, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ── Generic paginated container ──────────────────────────────────────────────
 
@@ -33,6 +33,77 @@ class PaginatedResponse(BaseModel, Generic[T]):
     page: int = 1
     page_size: int = 20
     total_pages: int = 1
+
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+
+
+class UserRegisterRequest(BaseModel):
+    """Payload to register a new user."""
+
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=8, max_length=128)
+    name: str = Field(..., min_length=1, max_length=256)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        if "@" not in v:
+            raise ValueError("Invalid email address")
+        return v.lower().strip()
+
+
+class UserLoginRequest(BaseModel):
+    """Payload to authenticate a user."""
+
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class TokenResponse(BaseModel):
+    """JWT token pair returned on login / refresh."""
+
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int  # seconds
+
+
+class RefreshTokenRequest(BaseModel):
+    """Payload to refresh an access token."""
+
+    refresh_token: str
+
+
+class UserResponse(BaseModel):
+    """Serialised user for API responses (no password hash)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    email: str
+    name: str
+    role: str
+    created_at: datetime
+    updated_at: datetime
+
+
+# ── Audit Log ────────────────────────────────────────────────────────────────
+
+
+class AuditLogResponse(BaseModel):
+    """Serialised audit log entry."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    user_id: Optional[str] = None
+    action: str
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+    detail: Optional[str] = None
+    ip_address: Optional[str] = None
+    created_at: datetime
 
 
 # ── Health ───────────────────────────────────────────────────────────────────

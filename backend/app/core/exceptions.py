@@ -112,3 +112,17 @@ class WorkflowError(ResearchOSError):
 
     status_code: int = 500
     detail: str = "Workflow execution failed."
+
+
+class AuthenticationError(ResearchOSError):
+    """Raised when authentication fails (bad credentials, expired token)."""
+
+    status_code: int = 401
+    detail: str = "Authentication failed."
+
+
+class AuthorizationError(ResearchOSError):
+    """Raised when the user lacks permissions for an operation."""
+
+    status_code: int = 403
+    detail: str = "Insufficient permissions."

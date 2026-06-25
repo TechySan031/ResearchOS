@@ -16,9 +16,33 @@ from app.api.v1.citations import router as citations_router
 from app.api.v1.agents import router as agents_router
 from app.api.v1.streaming import router as streaming_router
 from app.api.v1.copilot import router as copilot_router
+from app.api.v1.auth import router as auth_router
+from app.api.v1.audit import router as audit_router
+from app.api.v1.health import router as health_router
 
 
 v1_router = APIRouter()
+
+# ---- Authentication ----
+v1_router.include_router(
+    auth_router,
+    prefix="/auth",
+    tags=["Authentication"],
+)
+
+# ---- Health Checks ----
+v1_router.include_router(
+    health_router,
+    prefix="/health",
+    tags=["Health"],
+)
+
+# ---- Audit Logs ----
+v1_router.include_router(
+    audit_router,
+    prefix="/audit",
+    tags=["Audit"],
+)
 
 # ---- Project Management ----
 v1_router.include_router(
