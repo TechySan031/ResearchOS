@@ -179,6 +179,55 @@ async def logout(
     return {"detail": "Logged out successfully"}
 
 
+@router.post(
+    "/forgot-password",
+    status_code=status.HTTP_200_OK,
+    summary="Request password reset",
+)
+async def forgot_password(
+    data: dict,
+    request: Request,
+):
+    """Request a password reset link.
+
+    Always returns 200 to avoid leaking whether the email exists.
+    In production, this would send an email with a reset token.
+    Currently logs the token to the server console.
+
+    Args:
+        data: Dict with 'email' key.
+        request: The incoming request.
+    """
+    import secrets
+
+    email = data.get("email", "")
+    logger.info("api.auth.forgot_password", email=email)
+
+    # Check if user exists (but always return 200)
+    try:
+        user = await AuthService.get_user_by_email(email)
+        if user:
+            reset_token = secrets.token_urlsafe(32)
+            logger.info(
+                "api.auth.password_reset_token_generated",
+                user_id=user.id,
+                email=email,
+                reset_token=reset_token,
+            )
+            await AuditService.log(
+                action="password_reset_requested",
+                user_id=user.id,
+                resource_type="user",
+                resource_id=user.id,
+                ip_address=_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
+            )
+    except Exception:
+        pass  # Silently ignore — don't reveal user existence
+
+    return {"detail": "If an account exists with that email, reset instructions have been sent."}
+
+
 @router.get(
     "/me",
     response_model=UserResponse,

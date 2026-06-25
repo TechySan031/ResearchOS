@@ -5,17 +5,21 @@ import AppShell from '@/components/layout/AppShell';
 import MetricCard from '@/components/MetricCard';
 import ProjectCard from '@/components/dashboard/ProjectCard';
 import { useProjectStore } from '@/stores/projectStore';
+import { useToast } from '@/components/Toast';
 import {
   Plus,
   Beaker,
   FolderPlus,
   Sparkles,
   X,
+  Loader2,
 } from 'lucide-react';
 
 export default function Dashboard() {
   const { projects, isLoading, fetchProjects, createProject, deleteProject } = useProjectStore();
+  const { showToast } = useToast();
   const [showModal, setShowModal] = useState(false);
+  const [isCreating, setIsCreating] = useState(false);
 
   // New Project Fields
   const [title, setTitle] = useState('');
@@ -31,12 +35,13 @@ export default function Dashboard() {
     e.preventDefault();
     if (!title.trim()) return;
 
+    setIsCreating(true);
     try {
       await createProject({
         title,
         topic,
         description,
-        settings: { format_style: formatStyle }
+        settings: { format_style: formatStyle },
       });
 
       // Reset form
@@ -44,27 +49,36 @@ export default function Dashboard() {
       setTopic('');
       setDescription('');
       setShowModal(false);
+      showToast('Project created successfully', 'success');
       fetchProjects();
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      const msg = err.info?.detail || err.message || 'Failed to create project';
+      showToast(msg, 'error');
+    } finally {
+      setIsCreating(false);
     }
   };
 
   const handleDelete = async (id: string) => {
     if (confirm('Are you sure you want to delete this project? All papers, citations, and drafts will be deleted.')) {
-      await deleteProject(id);
+      try {
+        await deleteProject(id);
+        showToast('Project deleted', 'info');
+      } catch {
+        showToast('Failed to delete project', 'error');
+      }
     }
   };
 
   // Stats calculation
   const totalProjects = projects.length;
-  const researchingCount = projects.filter(p => p.status === 'researching').length;
-  const completedCount = projects.filter(p => p.status === 'completed').length;
-  const draftingCount = projects.filter(p => p.status === 'drafting').length;
+  const researchingCount = projects.filter((p) => p.status === 'researching').length;
+  const completedCount = projects.filter((p) => p.status === 'completed').length;
+  const draftingCount = projects.filter((p) => p.status === 'drafting').length;
 
   return (
     <AppShell>
-      <div className="space-y-8 select-none">
+      <div className="space-y-6 select-none">
         {/* Page title and action bar */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
@@ -79,7 +93,6 @@ export default function Dashboard() {
           <button
             onClick={() => setShowModal(true)}
             className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md text-sm font-medium shadow-sm transition-colors"
-            suppressHydrationWarning
           >
             <Plus className="w-4 h-4" />
             New Project
@@ -106,7 +119,6 @@ export default function Dashboard() {
           </div>
         </div>
 
-
         {/* Workflow Observability */}
         <div className="grid grid-cols-1">
           <MetricCard />
@@ -114,8 +126,25 @@ export default function Dashboard() {
 
         {/* Project List */}
         {isLoading && projects.length === 0 ? (
-          <div className="h-48 flex items-center justify-center text-sm text-gray-400">
-            Loading research projects...
+          /* Skeleton loader cards */
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+            {[1, 2, 3].map((i) => (
+              <div key={i} className="bg-white border border-gray-200 rounded-lg p-5 h-52 space-y-4">
+                <div className="flex items-center justify-between">
+                  <div className="skeleton h-5 w-24" />
+                  <div className="skeleton h-5 w-5 rounded" />
+                </div>
+                <div className="skeleton h-5 w-3/4" />
+                <div className="space-y-2">
+                  <div className="skeleton h-3 w-full" />
+                  <div className="skeleton h-3 w-2/3" />
+                </div>
+                <div className="flex items-center justify-between mt-auto pt-4">
+                  <div className="skeleton h-3 w-20" />
+                  <div className="skeleton h-4 w-12" />
+                </div>
+              </div>
+            ))}
           </div>
         ) : projects.length === 0 ? (
           <div className="bg-gray-50 rounded-lg border border-gray-200 p-12 text-center flex flex-col items-center justify-center gap-4">
@@ -129,7 +158,6 @@ export default function Dashboard() {
             <button
               onClick={() => setShowModal(true)}
               className="px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-md text-sm font-medium transition-colors"
-              suppressHydrationWarning
             >
               Get Started
             </button>
@@ -159,7 +187,6 @@ export default function Dashboard() {
                 <button
                   onClick={() => setShowModal(false)}
                   className="p-1 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors"
-                  suppressHydrationWarning
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -176,7 +203,6 @@ export default function Dashboard() {
                     onChange={(e) => setTitle(e.target.value)}
                     placeholder="e.g., Deep Learning in Quantum Computing"
                     className="w-full bg-white border border-gray-300 px-3 py-2 text-sm rounded-md placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow"
-                    suppressHydrationWarning
                   />
                 </div>
 
@@ -188,18 +214,18 @@ export default function Dashboard() {
                     onChange={(e) => setTopic(e.target.value)}
                     placeholder="Describe the topic the agents should research, retrieve papers for, and draft about..."
                     className="w-full bg-white border border-gray-300 px-3 py-2 text-sm rounded-md placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 min-h-[80px] transition-shadow"
-                    suppressHydrationWarning
                   />
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">Description <span className="text-gray-300 normal-case">(optional)</span></label>
+                  <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">
+                    Description <span className="text-gray-300 normal-case">(optional)</span>
+                  </label>
                   <textarea
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
                     placeholder="Additional notes or background information..."
                     className="w-full bg-white border border-gray-300 px-3 py-2 text-sm rounded-md placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 min-h-[60px] transition-shadow"
-                    suppressHydrationWarning
                   />
                 </div>
 
@@ -209,7 +235,6 @@ export default function Dashboard() {
                     value={formatStyle}
                     onChange={(e) => setFormatStyle(e.target.value)}
                     className="w-full bg-white border border-gray-300 px-3 py-2 text-sm rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow"
-                    suppressHydrationWarning
                   >
                     <option value="ieee">IEEE Conference</option>
                     <option value="acm">ACM Journal</option>
@@ -223,16 +248,22 @@ export default function Dashboard() {
                     type="button"
                     onClick={() => setShowModal(false)}
                     className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-800 bg-white border border-gray-300 hover:bg-gray-50 rounded-md transition-colors"
-                    suppressHydrationWarning
                   >
                     Cancel
                   </button>
                   <button
                     type="submit"
-                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md text-sm font-medium shadow-sm transition-colors"
-                    suppressHydrationWarning
+                    disabled={isCreating}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white rounded-md text-sm font-medium shadow-sm transition-colors flex items-center gap-1.5"
                   >
-                    Create Project
+                    {isCreating ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Creating...
+                      </>
+                    ) : (
+                      'Create Project'
+                    )}
                   </button>
                 </div>
               </form>

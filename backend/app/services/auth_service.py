@@ -64,13 +64,6 @@ class AuthService:
                     status_code=409,
                 )
 
-            print("\n" + "=" * 60)
-            print("REGISTER DEBUG")
-            print("password type:", type(password))
-            print("password value:", repr(password))
-            print("password length:", len(str(password)))
-            print("=" * 60 + "\n")
-
             user = User(
                 id=str(uuid.uuid4()),
                 email=email,
@@ -182,3 +175,20 @@ class AuthService:
             if user is None:
                 raise NotFoundError(f"User {user_id} not found")
             return user
+
+    @staticmethod
+    async def get_user_by_email(email: str) -> Optional[User]:
+        """Retrieve a user by email address.
+
+        Args:
+            email: Email to look up (case-insensitive).
+
+        Returns:
+            The matching ``User`` or ``None``.
+        """
+        email = email.lower().strip()
+        async with get_async_session() as session:
+            result = await session.execute(
+                select(User).where(User.email == email)
+            )
+            return result.scalar_one_or_none()

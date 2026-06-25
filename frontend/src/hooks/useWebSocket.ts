@@ -4,6 +4,8 @@ import { useProjectStore } from '../stores/projectStore';
 import { api } from '../lib/api';
 import { AgentLog, ResearchStatus } from '../types';
 
+const isDev = process.env.NODE_ENV === 'development';
+
 export function useWebSocket(projectId: string | undefined) {
   const socketRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
@@ -32,12 +34,8 @@ export function useWebSocket(projectId: string | undefined) {
       socketRef.current.close();
     }
 
-    let baseUrl = api.baseUrl;
-    if (typeof window !== 'undefined' && baseUrl.includes('localhost') && window.location.hostname !== 'localhost') {
-      baseUrl = baseUrl.replace('localhost', window.location.hostname);
-    }
+    const baseUrl = api.baseUrl;
     const wsUrl = baseUrl.replace(/^http/, 'ws') + `/api/v1/ws/${projectId}`;
-    console.log("WS URL =", wsUrl);
 
     const socket = new WebSocket(wsUrl);
     socketRef.current = socket;
@@ -45,17 +43,14 @@ export function useWebSocket(projectId: string | undefined) {
     socket.onopen = () => {
       setIsConnected(true);
       setError(null);
-      console.log('WebSocket connected successfully');
     };
 
     socket.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-        console.log('WebSocket received event:', msg.type, msg);
 
         switch (msg.type) {
           case 'connected':
-            console.log('Connection acknowledged by server:', msg.message);
             break;
 
           case 'agent_started':
@@ -120,32 +115,29 @@ export function useWebSocket(projectId: string | undefined) {
           }
 
           case 'pong':
-            console.log('WebSocket pong received');
             break;
 
           default:
-            console.log('Unhandled WebSocket event type:', msg.type);
+            if (isDev) {
+              // Only log unhandled events in development
+              // eslint-disable-next-line no-console
+              console.log('Unhandled WS event:', msg.type);
+            }
         }
       } catch (err) {
-        console.error('Error parsing WebSocket message:', err);
+        if (isDev) {
+          // eslint-disable-next-line no-console
+          console.error('WS message parse error:', err);
+        }
       }
     };
 
-    socket.onerror = (err) => {
-      console.error("WS ERROR");
-      console.error("URL:", wsUrl);
-      console.error(err);
+    socket.onerror = () => {
+      setError('WebSocket connection error');
     };
 
     socket.onclose = (event) => {
       setIsConnected(false);
-
-      console.error(
-        "WS CLOSED",
-        "code=", event.code,
-        "reason=", event.reason,
-        "clean=", event.wasClean
-      );
 
       if (event.code !== 1000 && projectId) {
         setTimeout(() => connect(), 3000);
@@ -168,7 +160,6 @@ export function useWebSocket(projectId: string | undefined) {
 
     return () => {
       if (socketRef.current) {
-        console.log('Closing WebSocket connection');
         socketRef.current.onopen = null;
         socketRef.current.onmessage = null;
         socketRef.current.onerror = null;
@@ -189,8 +180,6 @@ export function useWebSocket(projectId: string | undefined) {
           data,
         })
       );
-    } else {
-      console.warn('Cannot send input, WebSocket not connected');
     }
   }, [isConnected]);
 
