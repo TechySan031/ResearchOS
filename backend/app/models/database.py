@@ -296,12 +296,23 @@ class DocumentSectionModel(Base):
 
 # ── Engine & Session Factory ─────────────────────────────────────────────────
 
+database_url = settings.database_url
+
+# Railway provides postgresql://...
+# SQLAlchemy async requires postgresql+asyncpg://...
+if database_url.startswith("postgresql://"):
+    database_url = database_url.replace(
+        "postgresql://",
+        "postgresql+asyncpg://",
+        1,
+    )
+
 print("=" * 80)
-print("DATABASE URL:", settings.database_url)
+print("DATABASE URL:", database_url)
 print("=" * 80)
 
 _engine = create_async_engine(
-    settings.database_url,
+    database_url,
     echo=settings.app_debug,
     future=True,
 )
