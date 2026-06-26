@@ -8,7 +8,6 @@ import { useAuthStore } from '@/stores/authStore';
 import { useToast } from '@/components/Toast';
 
 function ResetPasswordForm() {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const token = searchParams.get('token');
   const { resetPassword } = useAuthStore();
@@ -79,8 +78,9 @@ function ResetPasswordForm() {
       await resetPassword(token, password);
       setCompleted(true);
       showToast('Password reset successfully', 'success');
-    } catch (err: any) {
-      const msg = err.info?.detail || err.message || 'Failed to reset password';
+    } catch (err: unknown) {
+      const errorObj = err as { info?: { detail?: string }; message?: string };
+      const msg = errorObj.info?.detail || errorObj.message || 'Failed to reset password';
       setError(msg);
       showToast(msg, 'error');
     } finally {
