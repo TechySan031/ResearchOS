@@ -5,6 +5,7 @@ import AppShell from '@/components/layout/AppShell';
 import MetricCard from '@/components/MetricCard';
 import ProjectCard from '@/components/dashboard/ProjectCard';
 import { useProjectStore } from '@/stores/projectStore';
+import { useAuthStore } from '@/stores/authStore';
 import { useToast } from '@/components/Toast';
 import {
   Plus,
