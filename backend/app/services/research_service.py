@@ -81,6 +81,8 @@ class ResearchService:
             "started_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "task": None,
             "cancel_event": asyncio.Event(),
+            "current_agent": "research_retrieval",
+            "progress_pct": 0.0,
         }
 
 
@@ -159,12 +161,11 @@ class ResearchService:
 
         wf = _active_workflows[project_id]
         return ResearchStatusResponse(
-            workflow_id=wf["workflow_id"],
             project_id=project_id,
-            topic=wf.get("topic", ""),
             status=wf.get("status", "unknown"),
-            started_at=wf.get("started_at", ""),
-            current_agent=wf.get("current_agent", ""),
+            started_at=wf.get("started_at"),
+            current_agent=wf.get("current_agent"),
+            progress_pct=wf.get("progress_pct", 0.0),
             completed_at=wf.get("completed_at"),
             error=wf.get("error"),
         )

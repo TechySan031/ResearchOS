@@ -22,7 +22,7 @@ async def publish_event(
     project_id: str,
     data: dict[str, Any] | None = None,
 ) -> None:
-    """Publish an agent event."""
+    """Publish an agent event and update the active workflow status registry."""
     try:
         bus = get_event_bus()
 
@@ -34,6 +34,58 @@ async def publish_event(
                 data=data or {},
             )
         )
+
+        # Update in-memory registry dynamically to prevent tab-switching status reset
+        try:
+            from app.services.research_service import _active_workflows
+            if project_id in _active_workflows:
+                wf = _active_workflows[project_id]
+                
+                # Update status on workflow events
+                if event_type == "workflow_completed":
+                    wf["current_agent"] = ""
+                    wf["status"] = "completed"
+                    wf["progress_pct"] = 100.0
+                elif event_type == "workflow_failed":
+                    wf["current_agent"] = ""
+                    wf["status"] = "failed"
+                elif event_type == "workflow_cancelled":
+                    wf["current_agent"] = ""
+                    wf["status"] = "cancelled"
+                else:
+                    # Update current agent on agent started
+                    if event_type == "started":
+                        wf["current_agent"] = agent_name
+
+                    # Compute progress percentage based on agent order
+                    agents_order = [
+                        "research_retrieval",
+                        "literature_review",
+                        "citation_verification",
+                        "gap_analysis",
+                        "methodology_suggestion",
+                        "draft_writing",
+                        "hallucination_detection",
+                        "formatting",
+                        "journal_recommendation",
+                        "reviewer_simulation",
+                        "submission_preparation",
+                    ]
+                    if agent_name in agents_order:
+                        idx = agents_order.index(agent_name)
+                        if event_type == "started":
+                            progress = (idx / len(agents_order)) * 100.0
+                        elif event_type == "completed":
+                            progress = ((idx + 1) / len(agents_order)) * 100.0
+                        else:
+                            progress = wf.get("progress_pct", 0.0)
+                        wf["progress_pct"] = round(progress, 2)
+        except Exception as e:
+            logger.warning(
+                "active_workflows_update_failed",
+                project_id=project_id,
+                error=str(e),
+            )
     except Exception as exc:
         logger.warning(
             "event_publish_failed",
@@ -79,18 +131,25 @@ def _papers_context(
     lines: list[str] = []
 
     for i, paper in enumerate(papers[:max_papers], start=1):
-        authors = paper.get("authors", [])
+        authors = paper.get("authors")
 
         if isinstance(authors, list):
-            author_text = ", ".join(str(a) for a in authors[:5])
+            if len(authors) > 5:
+                author_text = ", ".join(str(a) for a in authors[:5]) + ", et al."
+            else:
+                author_text = ", ".join(str(a) for a in authors) if authors else "N/A"
         else:
-            author_text = str(authors)
+            author_text = str(authors) if authors else "N/A"
+
+        abstract = paper.get("abstract") or "No abstract available"
+        doi = paper.get("doi") or "N/A"
+        year = paper.get("year") or "N/A"
 
         lines.append(
-            f"[REF_{i}] {paper.get('title', 'Untitled')}\n"
+            f"[REF_{i}] {paper.get('title', 'Untitled')} ({year})\n"
             f"Authors: {author_text}\n"
-            f"Abstract: {paper.get('abstract', '')}\n"
-            f"DOI: {paper.get('doi', '')}\n"
+            f"Abstract: {abstract}\n"
+            f"DOI: {doi}\n"
         )
 
     return "\n\n".join(lines)

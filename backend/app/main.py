@@ -153,7 +153,7 @@ def create_app() -> FastAPI:
             "version": "0.1.0",
             "description": "AI Research Operating System",
             "docs": "/docs",
-            "health": "/api/v1/health",
+            "health": "/health",
             "api": "/api/v1",
         }
 

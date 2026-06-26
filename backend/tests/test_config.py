@@ -8,46 +8,52 @@ from app.config import Settings, get_settings
 class TestSettings:
     """Test Pydantic Settings configuration."""
 
+    @pytest.fixture
+    def settings(self, monkeypatch):
+        for var in [
+            "APP_NAME",
+            "APP_ENV",
+            "APP_DEBUG",
+            "APP_PORT",
+            "DATABASE_URL",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_DIMENSION",
+            "CORS_ORIGINS",
+        ]:
+            monkeypatch.delenv(var, raising=False)
+        return Settings(_env_file=None)
+
     def test_settings_singleton(self):
         """get_settings() returns the same object on repeated calls."""
         s1 = get_settings()
         s2 = get_settings()
         assert s1 is s2
 
-    def test_default_app_name(self):
-        settings = get_settings()
+    def test_default_app_name(self, settings):
         assert settings.app_name == "ResearchOS"
 
-    def test_default_environment(self):
-        settings = get_settings()
+    def test_default_environment(self, settings):
         assert settings.app_env in ("development", "testing", "production")
 
-    def test_default_port(self):
-        settings = get_settings()
+    def test_default_port(self, settings):
         assert settings.app_port == 8000
 
-    def test_default_database_url(self):
-        settings = get_settings()
+    def test_default_database_url(self, settings):
         assert "sqlite" in settings.database_url or "postgresql" in settings.database_url
 
-    def test_embedding_model(self):
-        settings = get_settings()
+    def test_embedding_model(self, settings):
         assert "bge" in settings.embedding_model.lower() or "BAAI" in settings.embedding_model
 
-    def test_embedding_dimension(self):
-        settings = get_settings()
+    def test_embedding_dimension(self, settings):
         assert settings.embedding_dimension == 1024
 
-    def test_cors_origins_is_list(self):
-        settings = get_settings()
+    def test_cors_origins_is_list(self, settings):
         assert isinstance(settings.cors_origins, list)
 
-    def test_is_production_false_by_default(self):
-        settings = get_settings()
+    def test_is_production_false_by_default(self, settings):
         assert settings.is_production is False
 
-    def test_is_development_true_by_default(self):
-        settings = get_settings()
+    def test_is_development_true_by_default(self, settings):
         assert settings.is_development is True
 
 

@@ -8,8 +8,16 @@ from app.main import create_app
 
 
 @pytest_asyncio.fixture
-async def client():
-    """Lightweight async client — no DB dependency override needed."""
+async def client(monkeypatch):
+    """Lightweight async client with mocked DB connectivity for health check."""
+    from unittest.mock import MagicMock, AsyncMock
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock()
+    mock_session_factory = MagicMock()
+    mock_session_factory.return_value.__aenter__.return_value = mock_session
+    
+    monkeypatch.setattr("app.main.async_session_factory", mock_session_factory)
+
     app = create_app()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
