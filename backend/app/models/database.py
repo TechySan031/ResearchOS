@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, AsyncGenerator, Optional
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -53,8 +54,7 @@ class Base(AsyncAttrs, DeclarativeBase):
 def _uuid() -> str:
     return str(uuid.uuid4())
 
-
-# ── User ─────────────────────────────────────────────────────────────────────
+    # ── User ─────────────────────────────────────────────────────────────────────
 
 
 class UserModel(Base):
@@ -63,35 +63,125 @@ class UserModel(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=_uuid,
+        String(36),
+        primary_key=True,
+        default=_uuid,
     )
+
     email: Mapped[str] = mapped_column(
-        String(320), unique=True, nullable=False, index=True,
+        String(320),
+        unique=True,
+        nullable=False,
+        index=True,
     )
-    name: Mapped[str] = mapped_column(String(256), nullable=False)
+
+    name: Mapped[str] = mapped_column(
+        String(256),
+        nullable=False,
+    )
+
     hashed_password: Mapped[Optional[str]] = mapped_column(
-        String(512), nullable=True,
+        String(512),
+        nullable=True,
     )
+
     role: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="researcher", index=True,
+        String(32),
+        nullable=False,
+        default="researcher",
+        index=True,
     )
+
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(),
+        DateTime(timezone=True),
+        server_default=func.now(),
     )
+
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
     # Relationships
     projects: Mapped[list["ProjectModel"]] = relationship(
-        back_populates="owner", cascade="all, delete-orphan",
+        back_populates="owner",
+        cascade="all, delete-orphan",
     )
+
     audit_logs: Mapped[list["AuditLogModel"]] = relationship(
-        back_populates="user", cascade="all, delete-orphan",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    password_reset_tokens: Mapped[list["PasswordResetTokenModel"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
     )
 
     def __repr__(self) -> str:
-        return f"<User id={self.id!r} email={self.email!r} role={self.role!r}>"
+        return (
+            f"<User id={self.id!r} "
+            f"email={self.email!r} "
+            f"role={self.role!r}>"
+        )
+
+
+# ── Password Reset Token ─────────────────────────────────────────────────────
+
+
+class PasswordResetTokenModel(Base):
+    """Password reset token for account recovery."""
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=_uuid,
+    )
+
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+
+    token: Mapped[str] = mapped_column(
+        String(128),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    used: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    # Relationship
+    user: Mapped["UserModel"] = relationship(
+        back_populates="password_reset_tokens",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PasswordResetToken "
+            f"user_id={self.user_id!r} "
+            f"used={self.used}>"
+        )
 
 
 # ── Project ──────────────────────────────────────────────────────────────────
@@ -99,6 +189,7 @@ class UserModel(Base):
 
 class ProjectModel(Base):
     """A single research project/workflow."""
+
 
     __tablename__ = "projects"
 

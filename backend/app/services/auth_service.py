@@ -6,14 +6,14 @@ creation to ``app.core.security``.
 
 from __future__ import annotations
 
-import uuid
 import datetime as _dt
+import secrets
+import uuid
+from datetime import timedelta
 from typing import Optional
 
 from jose import JWTError
-from sqlalchemy import select
-
-from app.config import get_settings
+from sqlalchemy import delete, select
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.security import (
     create_access_token,
@@ -22,7 +22,11 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
-from app.models.database import User, get_async_session
+from app.models.database import (
+    User,
+    PasswordResetToken,
+    get_async_session,
+)
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -192,3 +196,139 @@ class AuthService:
                 select(User).where(User.email == email)
             )
             return result.scalar_one_or_none()
+
+    @staticmethod
+    async def create_password_reset_token(user: User) -> str:
+        """Create a new password reset token."""
+
+        token = secrets.token_urlsafe(48)
+
+        expires_at = (
+            _dt.datetime.now(_dt.timezone.utc)
+            + timedelta(hours=1)
+        )
+
+        async with get_async_session() as session:
+
+            # Remove previous unused tokens
+            await session.execute(
+                delete(PasswordResetToken).where(
+                    PasswordResetToken.user_id == user.id
+                )
+            )
+
+            reset = PasswordResetToken(
+                id=str(uuid.uuid4()),
+                user_id=user.id,
+                token=token,
+                expires_at=expires_at,
+                used=False,
+            )
+
+            session.add(reset)
+            await session.commit()
+
+        logger.info(
+            "auth.password_reset_token_created",
+            user_id=user.id,
+        )
+
+        return token
+
+    @staticmethod
+    async def verify_password_reset_token(
+        token: str,
+    ) -> PasswordResetToken:
+        """Validate a password reset token."""
+
+        async with get_async_session() as session:
+
+            result = await session.execute(
+                select(PasswordResetToken).where(
+                    PasswordResetToken.token == token
+                )
+            )
+
+            reset = result.scalar_one_or_none()
+
+            if reset is None:
+                raise ValidationError(
+                    "Invalid reset token",
+                    status_code=400,
+                )
+
+            if reset.used:
+                raise ValidationError(
+                    "Reset token already used",
+                    status_code=400,
+                )
+
+            if reset.expires_at < _dt.datetime.now(_dt.timezone.utc):
+                raise ValidationError(
+                    "Reset token has expired",
+                    status_code=400,
+                )
+
+            return reset
+ 
+
+    @staticmethod
+    async def reset_password(
+        token: str,
+        new_password: str,
+    ) -> None:
+        """Reset a user's password."""
+
+        async with get_async_session() as session:
+
+            result = await session.execute(
+                select(PasswordResetToken).where(
+                    PasswordResetToken.token == token
+                )
+            )
+
+            reset = result.scalar_one_or_none()
+
+            if reset is None:
+                raise ValidationError(
+                    "Invalid reset token",
+                    status_code=400,
+                )
+
+            if reset.used:
+                raise ValidationError(
+                    "Reset token already used",
+                    status_code=400,
+                )
+
+            if reset.expires_at < _dt.datetime.now(_dt.timezone.utc):
+                raise ValidationError(
+                    "Reset token expired",
+                    status_code=400,
+                )
+
+            result = await session.execute(
+                select(User).where(
+                    User.id == reset.user_id
+                )
+            )
+
+            user = result.scalar_one_or_none()
+
+            user.hashed_password = hash_password(new_password)
+            user.updated_at = _dt.datetime.now(
+                _dt.timezone.utc
+            )
+
+            await session.execute(
+                delete(PasswordResetToken).where(
+                    PasswordResetToken.user_id == user.id
+                )
+            )
+
+            await session.commit()
+
+        logger.info(
+            "auth.password_reset_completed",
+            user_id=user.id,
+        )

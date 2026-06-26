@@ -5,22 +5,24 @@ Supports:
 - Offline (--sql) mode with dialect-appropriate sync URLs
 - Online mode via ``run_async_migrations()`` pattern
 """
-
 import asyncio
+import os
+import sys
 from logging.config import fileConfig
+
+# Add backend directory to Python path BEFORE importing app.*
+sys.path.insert(
+    0,
+    os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+)
 
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-# ── Import project components ────────────────────────────────────────────────
-# These imports require the *backend/* directory to be on ``sys.path``.
-# Running ``alembic`` from the backend/ folder satisfies this automatically.
-
 from app.config import get_settings
 from app.models.database import Base
-
 # ── Alembic Config object ───────────────────────────────────────────────────
 
 config = context.config

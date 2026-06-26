@@ -20,11 +20,24 @@ from app.models.schemas import (
 )
 from app.services.audit_service import AuditService
 from app.services.auth_service import AuthService
+from app.services.email_service import EmailService
 from app.utils.logging import get_logger
+from pydantic import BaseModel, EmailStr, Field
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["auth"])
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str = Field(
+        min_length=8,
+        max_length=128,
+    )
 
 
 def _client_ip(request: Request) -> str:
@@ -184,36 +197,48 @@ async def logout(
     status_code=status.HTTP_200_OK,
     summary="Request password reset",
 )
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
 async def forgot_password(
     data: dict,
     request: Request,
 ):
-    """Request a password reset link.
-
-    Always returns 200 to avoid leaking whether the email exists.
-    In production, this would send an email with a reset token.
-    Currently logs the token to the server console.
-
-    Args:
-        data: Dict with 'email' key.
-        request: The incoming request.
     """
-    import secrets
+    Generate a password reset token and send a reset email.
 
-    email = data.get("email", "")
-    logger.info("api.auth.forgot_password", email=email)
+    Always returns HTTP 200 to avoid revealing whether
+    the email exists.
+    """
 
-    # Check if user exists (but always return 200)
+    email = data.email.strip().lower()
+
+    logger.info(
+        "api.auth.forgot_password",
+        email=email,
+    )
+
     try:
+
         user = await AuthService.get_user_by_email(email)
+
         if user:
-            reset_token = secrets.token_urlsafe(32)
-            logger.info(
-                "api.auth.password_reset_token_generated",
-                user_id=user.id,
-                email=email,
-                reset_token=reset_token,
+
+            token = await AuthService.create_password_reset_token(user)
+
+            settings = get_settings()
+
+            reset_url = (
+                f"{settings.frontend_url}/reset-password?token={token}"
             )
+
+            await EmailService.send_password_reset_email(
+                email=user.email,
+                name=user.name,
+                reset_url=reset_url,
+            )
+
             await AuditService.log(
                 action="password_reset_requested",
                 user_id=user.id,
@@ -222,10 +247,46 @@ async def forgot_password(
                 ip_address=_client_ip(request),
                 user_agent=request.headers.get("user-agent"),
             )
-    except Exception:
-        pass  # Silently ignore — don't reveal user existence
 
-    return {"detail": "If an account exists with that email, reset instructions have been sent."}
+    except Exception as exc:
+
+        logger.exception(
+            "api.auth.forgot_password_failed",
+            error=str(exc),
+        )
+
+    return {
+        "detail":
+        "If an account exists with that email, reset instructions have been sent."
+    }
+
+@router.post(
+    "/reset-password",
+    status_code=status.HTTP_200_OK,
+    summary="Reset password",
+)
+async def reset_password(
+    data: ResetPasswordRequest,
+):
+    """
+    Reset the user's password using a valid reset token.
+    """
+
+    try:
+        await AuthService.reset_password(
+            token=data.token,
+            new_password=data.password,
+        )
+
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
+
+    return {
+        "detail": "Password reset successful."
+    }
 
 
 @router.get(
