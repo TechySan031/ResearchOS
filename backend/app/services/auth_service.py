@@ -24,7 +24,7 @@ from app.core.security import (
 )
 from app.models.database import (
     User,
-    PasswordResetToken,
+    PasswordResetTokenModel,
     get_async_session,
 )
 from app.utils.logging import get_logger
@@ -212,12 +212,12 @@ class AuthService:
 
             # Remove previous unused tokens
             await session.execute(
-                delete(PasswordResetToken).where(
-                    PasswordResetToken.user_id == user.id
+                delete(PasswordResetTokenModel).where(
+                    PasswordResetTokenModel.user_id == user.id
                 )
             )
 
-            reset = PasswordResetToken(
+            reset = PasswordResetTokenModel(
                 id=str(uuid.uuid4()),
                 user_id=user.id,
                 token=token,
@@ -238,14 +238,14 @@ class AuthService:
     @staticmethod
     async def verify_password_reset_token(
         token: str,
-    ) -> PasswordResetToken:
+    ) -> PasswordResetTokenModel:
         """Validate a password reset token."""
 
         async with get_async_session() as session:
 
             result = await session.execute(
-                select(PasswordResetToken).where(
-                    PasswordResetToken.token == token
+                select(PasswordResetTokenModel).where(
+                    PasswordResetTokenModel.token == token
                 )
             )
 
@@ -282,8 +282,8 @@ class AuthService:
         async with get_async_session() as session:
 
             result = await session.execute(
-                select(PasswordResetToken).where(
-                    PasswordResetToken.token == token
+                select(PasswordResetTokenModel).where(
+                    PasswordResetTokenModel.token == token
                 )
             )
 
@@ -321,8 +321,8 @@ class AuthService:
             )
 
             await session.execute(
-                delete(PasswordResetToken).where(
-                    PasswordResetToken.user_id == user.id
+                delete(PasswordResetTokenModel).where(
+                    PasswordResetTokenModel.user_id == user.id
                 )
             )
 
