@@ -248,7 +248,8 @@ async def forgot_password(
 
     # ── Step 3: Build reset URL ──
     settings = get_settings()
-    reset_url = f"{settings.frontend_url}/reset-password?token={token}"
+    frontend_url = settings.frontend_url.rstrip("/")
+    reset_url = f"{frontend_url}/reset-password?token={token}"
 
     logger.info(
         "api.auth.forgot_password.sending_email",
