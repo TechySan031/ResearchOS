@@ -198,11 +198,8 @@ async def logout(
     summary="Request password reset",
 )
 
-class ForgotPasswordRequest(BaseModel):
-    email: str
-
 async def forgot_password(
-    data: dict,
+    data: ForgotPasswordRequest,
     request: Request,
 ):
     """
@@ -215,49 +212,92 @@ async def forgot_password(
     email = data.email.strip().lower()
 
     logger.info(
-        "api.auth.forgot_password",
+        "api.auth.forgot_password.start",
         email=email,
     )
 
+    # ── Step 1: Look up user ──
     try:
-
         user = await AuthService.get_user_by_email(email)
-
-        if user:
-
-            token = await AuthService.create_password_reset_token(user)
-
-            settings = get_settings()
-
-            reset_url = (
-                f"{settings.frontend_url}/reset-password?token={token}"
-            )
-
-            await EmailService.send_password_reset_email(
-                email=user.email,
-                name=user.name,
-                reset_url=reset_url,
-            )
-
-            await AuditService.log(
-                action="password_reset_requested",
-                user_id=user.id,
-                resource_type="user",
-                resource_id=user.id,
-                ip_address=_client_ip(request),
-                user_agent=request.headers.get("user-agent"),
-            )
-
     except Exception as exc:
+        logger.exception("api.auth.forgot_password.user_lookup_failed", error=str(exc))
+        return {
+            "detail": "If an account exists with that email, reset instructions have been sent.",
+            "_debug_error": f"user_lookup_failed: {type(exc).__name__}: {exc}",
+        }
 
-        logger.exception(
-            "api.auth.forgot_password_failed",
-            error=str(exc),
+    if not user:
+        logger.info("api.auth.forgot_password.user_not_found", email=email)
+        return {
+            "detail": "If an account exists with that email, reset instructions have been sent.",
+        }
+
+    logger.info("api.auth.forgot_password.user_found", user_id=user.id)
+
+    # ── Step 2: Create reset token ──
+    try:
+        token = await AuthService.create_password_reset_token(user)
+    except Exception as exc:
+        logger.exception("api.auth.forgot_password.token_creation_failed", error=str(exc))
+        return {
+            "detail": "If an account exists with that email, reset instructions have been sent.",
+            "_debug_error": f"token_creation_failed: {type(exc).__name__}: {exc}",
+        }
+
+    logger.info("api.auth.forgot_password.token_created", user_id=user.id)
+
+    # ── Step 3: Build reset URL ──
+    settings = get_settings()
+    reset_url = f"{settings.frontend_url}/reset-password?token={token}"
+
+    logger.info(
+        "api.auth.forgot_password.sending_email",
+        user_id=user.id,
+        email=user.email,
+        frontend_url=settings.frontend_url,
+        email_from=settings.email_from,
+        has_resend_key=bool(settings.resend_api_key),
+        resend_key_prefix=settings.resend_api_key[:8] + "..." if settings.resend_api_key else "EMPTY",
+    )
+
+    # ── Step 4: Send email ──
+    try:
+        email_sent = await EmailService.send_password_reset_email(
+            email=user.email,
+            name=user.name,
+            reset_url=reset_url,
         )
+    except Exception as exc:
+        logger.exception("api.auth.forgot_password.email_send_exception", error=str(exc))
+        return {
+            "detail": "If an account exists with that email, reset instructions have been sent.",
+            "_debug_error": f"email_send_exception: {type(exc).__name__}: {exc}",
+        }
+
+    if not email_sent:
+        logger.error("api.auth.forgot_password.email_send_returned_false", user_id=user.id)
+        return {
+            "detail": "If an account exists with that email, reset instructions have been sent.",
+            "_debug_error": "email_service_returned_false — check RESEND_API_KEY and EMAIL_FROM config",
+        }
+
+    logger.info("api.auth.forgot_password.email_sent_successfully", user_id=user.id)
+
+    # ── Step 5: Audit log ──
+    try:
+        await AuditService.log(
+            action="password_reset_requested",
+            user_id=user.id,
+            resource_type="user",
+            resource_id=user.id,
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+    except Exception as exc:
+        logger.exception("api.auth.forgot_password.audit_log_failed", error=str(exc))
 
     return {
-        "detail":
-        "If an account exists with that email, reset instructions have been sent."
+        "detail": "If an account exists with that email, reset instructions have been sent.",
     }
 
 @router.post(

@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     # ── Email (Resend) ─────────────────────────────────────
     resend_api_key: str = ""
     email_from: str = "onboarding@resend.dev"
+
+    # ── Frontend ──────────────────────────────────────────────
+    frontend_url: str = "http://localhost:3000"
+
+
     # ── Per-Endpoint Rate Limits (requests per minute) ────────────────────
     rate_limit_auth_per_minute: int = 20
     rate_limit_workflow_per_minute: int = 10
