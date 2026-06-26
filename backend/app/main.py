@@ -33,6 +33,12 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging()
 
+    logger.info(
+        "email_configuration",
+        resend_configured=bool(settings.resend_api_key),
+        email_from=settings.email_from,
+    )   
+
     # Fail fast if production config is invalid
     validate_production_settings()
 
