@@ -67,13 +67,9 @@ class EmbeddingGenerator:
                 return
 
             settings = get_settings()
-            self._model_name = getattr(
-                settings, "EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5"
-            )
-            device = getattr(settings, "EMBEDDING_DEVICE", "cpu")
-            self._dimension = int(
-                getattr(settings, "EMBEDDING_DIMENSION", 1024)
-            )
+            self._model_name = settings.embedding_model or "BAAI/bge-large-en-v1.5"
+            device = settings.embedding_device or "cpu"
+            self._dimension = int(settings.embedding_dimension or 1024)
 
             import time
             logger.info(

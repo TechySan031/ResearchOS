@@ -96,7 +96,7 @@ class SemanticScholarClient:
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
             settings = get_settings()
-            self._api_key = getattr(settings, "SEMANTIC_SCHOLAR_API_KEY", None)
+            self._api_key = settings.semantic_scholar_api_key or None
             if self._api_key in (None, "", "your-semantic-scholar-api-key"):
                 self._api_key = None
 
