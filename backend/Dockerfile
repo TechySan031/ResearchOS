@@ -63,6 +63,9 @@ COPY --chown=appuser:appuser . .
 # Switch to non-root user
 USER appuser
 
+# Pre-download the embedding model so it is cached in the image
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-en-v1.5')"
+
 EXPOSE 8000
 
 # Health check — hit the /health endpoint every 30 s

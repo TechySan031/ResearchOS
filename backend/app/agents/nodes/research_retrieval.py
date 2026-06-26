@@ -344,13 +344,14 @@ async def _node(state: ResearchState) -> dict[str, Any]:
     start_time = _dt.datetime.now(_dt.timezone.utc)
 
     logger.info(
-        ".start",
+        "research_retrieval.start",
         topic=topic,
         project_id=project_id,
     )
 
     # Publish start event
     try:
+        logger.info("research_retrieval.publishing_start_event", project_id=project_id)
         event_bus = EventBus()
         await event_bus.publish(
             AgentEvent(
@@ -360,14 +361,15 @@ async def _node(state: ResearchState) -> dict[str, Any]:
                 data={"topic": topic},
             )
         )
-    except Exception:
-        logger.warning(".event_publish_failed")
+        logger.info("research_retrieval.published_start_event", project_id=project_id)
+    except Exception as exc:
+        logger.warning("research_retrieval.event_publish_failed", error=str(exc))
 
     errors: list[dict[str, Any]] = []
 
     # 1. Generate search queries
     queries = _generate_queries(topic)
-    logger.info(".queries", queries=queries)
+    logger.info("research_retrieval.queries", queries=queries)
 
     # 2. Search all sources in parallel for each query
     per_query_limit = 15
@@ -377,15 +379,18 @@ async def _node(state: ResearchState) -> dict[str, Any]:
         search_coros.append(_search_semantic_scholar(q, per_query_limit))
         search_coros.append(_search_crossref(q, per_query_limit))
 
+    logger.info("research_retrieval.initiating_parallel_searches", coro_count=len(search_coros))
     all_results = await asyncio.gather(*search_coros, return_exceptions=True)
+    logger.info("research_retrieval.parallel_searches_completed", result_count=len(all_results))
 
     # Flatten, skipping exceptions
     all_papers: list[dict[str, Any]] = []
     for result in all_results:
         if isinstance(result, BaseException):
+            logger.error("research_retrieval.search_coroutine_failed", error=str(result))
             errors.append(
                 {
-                    "agent": "",
+                    "agent": "research_retrieval",
                     "error": str(result),
                     "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
                 }
@@ -395,14 +400,14 @@ async def _node(state: ResearchState) -> dict[str, Any]:
             all_papers.extend(result)
 
     logger.info(
-        ".raw_count",
+        "research_retrieval.raw_count",
         raw_count=len(all_papers),
     )
 
     # 3. Deduplicate
     unique_papers = _deduplicate_papers(all_papers)
     logger.info(
-        ".dedup_count",
+        "research_retrieval.dedup_count",
         dedup_count=len(unique_papers),
     )
 
@@ -410,12 +415,15 @@ async def _node(state: ResearchState) -> dict[str, Any]:
     ranked_papers = _rank_papers(unique_papers)
 
     # 5. Index into vector store
+    logger.info("research_retrieval.starting_indexing", paper_count=len(ranked_papers))
     embeddings_stored = await _index_papers(ranked_papers, project_id)
+    logger.info("research_retrieval.indexing_completed", success=embeddings_stored)
 
     elapsed = (_dt.datetime.now(_dt.timezone.utc) - start_time).total_seconds()
 
     # Publish completion event
     try:
+        logger.info("research_retrieval.publishing_completion_event", project_id=project_id)
         event_bus = EventBus()
         await event_bus.publish(
             AgentEvent(
@@ -429,11 +437,12 @@ async def _node(state: ResearchState) -> dict[str, Any]:
                 },
             )
         )
-    except Exception:
-        logger.warning(".event_publish_failed")
+        logger.info("research_retrieval.published_completion_event", project_id=project_id)
+    except Exception as exc:
+        logger.warning("research_retrieval.event_publish_failed", error=str(exc))
 
     logger.info(
-        ".complete",
+        "research_retrieval.complete",
         paper_count=len(ranked_papers),
         embeddings_stored=embeddings_stored,
         elapsed_seconds=elapsed,
@@ -445,7 +454,7 @@ async def _node(state: ResearchState) -> dict[str, Any]:
         "current_agent": "",
         "agent_history": [
             {
-                "agent": "",
+                "agent": "research_retrieval",
                 "status": "completed",
                 "paper_count": len(ranked_papers),
                 "queries_used": queries,

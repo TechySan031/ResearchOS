@@ -75,11 +75,13 @@ class EmbeddingGenerator:
                 getattr(settings, "EMBEDDING_DIMENSION", 1024)
             )
 
+            import time
             logger.info(
                 "embeddings.loading_model",
                 model=self._model_name,
                 device=device,
             )
+            start_time = time.perf_counter()
 
             try:
                 from sentence_transformers import SentenceTransformer
@@ -89,10 +91,12 @@ class EmbeddingGenerator:
                     self._model_name,
                     device=device,
                 )
+                duration = time.perf_counter() - start_time
                 logger.info(
                     "embeddings.model_loaded",
                     model=self._model_name,
                     dimension=self._dimension,
+                    duration_seconds=round(duration, 2),
                 )
             except Exception as exc:
                 logger.error(

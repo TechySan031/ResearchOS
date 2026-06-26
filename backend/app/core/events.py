@@ -118,9 +118,12 @@ class EventBus:
             return count
 
         try:
-            receivers: int = await redis_client.publish(
-                self._channel,
-                event.to_json(),
+            receivers: int = await asyncio.wait_for(
+                redis_client.publish(
+                    self._channel,
+                    event.to_json(),
+                ),
+                timeout=5.0
             )
             logger.debug(
                 "event_bus.published",
@@ -130,6 +133,14 @@ class EventBus:
                 receivers=receivers,
             )
             return receivers
+        except asyncio.TimeoutError:
+            logger.error(
+                "event_bus.publish.timeout",
+                event_id=event.event_id,
+                agent=event.agent_name,
+                timeout=5.0,
+            )
+            return 0
         except Exception:
             logger.exception(
                 "event_bus.publish.error",
