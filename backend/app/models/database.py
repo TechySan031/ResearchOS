@@ -496,3 +496,5 @@ Citation = CitationModel
 AgentLog = AgentLogModel
 DocumentSection = DocumentSectionModel
 AuditLog = AuditLogModel
+User = UserModel
+PasswordResetToken = PasswordResetTokenModel
