@@ -33,6 +33,7 @@ interface AuthState {
   refreshAccessToken: () => Promise<boolean>;
   fetchCurrentUser: () => Promise<void>;
   forgotPassword: (email: string) => Promise<void>;
+  resetPassword: (token: string, password: string) => Promise<void>;
   initialize: () => void;
   clearError: () => void;
 }
@@ -220,6 +221,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   forgotPassword: async (email: string) => {
     await api.post('/api/v1/auth/forgot-password', { email });
+  },
+
+  resetPassword: async (token: string, password: string) => {
+    await api.post('/api/v1/auth/reset-password', { token, password });
   },
 
   clearError: () => set({ error: null }),
