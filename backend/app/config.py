@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     app_log_level: str = "DEBUG"
 
     # ── Database ─────────────────────────────────────────────────────────
-    database_url: str = "sqlite+aiosqlite:///./researchos.db"
+    database_url: str = "postgresql+asyncpg://researchos:Qazxsw!98@localhost:5432/researchos"
 
     # ── Redis ────────────────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     jwt_expiration_minutes: int = 30
     jwt_refresh_expiration_days: int = 7
 
+    # ── Email (Resend) ─────────────────────────────────────
+    resend_api_key: str = ""
+    email_from: str = "onboarding@resend.dev"
     # ── Per-Endpoint Rate Limits (requests per minute) ────────────────────
     rate_limit_auth_per_minute: int = 20
     rate_limit_workflow_per_minute: int = 10
