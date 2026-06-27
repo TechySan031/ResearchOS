@@ -24,6 +24,8 @@ logger = structlog.stdlib.get_logger(__name__)
 # ── Data Structures ──────────────────────────────────────────────────────────
 
 AGENT_EVENTS_CHANNEL = "researchos:agent_events"
+_LOCAL_SUBSCRIBERS: list[asyncio.Queue[AgentEvent]] = []
+_bus: EventBus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +80,7 @@ class EventBus:
     ) -> None:
         self._redis = redis_client
         self._channel = channel
-        self._local_subscribers: list[asyncio.Queue[AgentEvent]] = []
+        self._local_subscribers = _LOCAL_SUBSCRIBERS
 
     @property
     def redis(self) -> Any | None:
@@ -243,25 +245,16 @@ _bus: EventBus | None = None
 
 
 def init_event_bus(redis_client: Any | None = None) -> EventBus:
-    """Create or replace the module-level ``EventBus`` singleton.
-
-    Call this during application startup once the Redis connection is
-    established.
-    """
     global _bus
     _bus = EventBus(redis_client=redis_client)
     return _bus
-
-
+    
 def get_event_bus() -> EventBus:
-    """Return the current ``EventBus`` singleton.
-
-    If the bus has not been initialised yet, a degraded (no-Redis) instance is
-    returned so that callers never get ``None``.
-    """
     global _bus
+
     if _bus is None:
         _bus = EventBus()
+
     return _bus
 
 

@@ -49,6 +49,8 @@ export function useWebSocket(projectId: string | undefined) {
       try {
         const msg = JSON.parse(event.data);
 
+        console.log("WS EVENT:", msg);
+
         switch (msg.type) {
           case 'connected':
             break;

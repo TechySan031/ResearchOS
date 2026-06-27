@@ -1,0 +1,4827 @@
+
+============================================================
+FILE: app\agents\graph.py
+============================================================
+"""LangGraph workflow builder for ResearchOS.
+
+Constructs the full multi-agent research workflow graph with all nodes,
+conditional edges (driven by the deterministic supervisor), and
+checkpointing.
+
+All 11 agent nodes are now real implementations backed by LLM calls
+(Mistral / Kimi) — no more placeholders.
+
+Usage::
+
+    graph = build_research_graph()
+    final_state = await run_workflow("quantum computing survey", "proj-123")
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+from typing import Any
+import traceback
+# pyrefly: ignore [missing-import]
+from langgraph.graph import StateGraph, END
+# pyrefly: ignore [missing-import]
+from langgraph.checkpoint.memory import MemorySaver
+
+from app.agents.state import ResearchState
+from app.agents.supervisor import route
+from app.agents.nodes import (
+    research_retrieval_node,
+    literature_review_node,
+    citation_verification_node,
+    gap_analysis_node,
+    methodology_suggestion_node,
+    draft_writing_node,
+    hallucination_detection_node,
+    formatting_node,
+    journal_recommendation_node,
+    reviewer_simulation_node,
+    submission_preparation_node,
+)
+from app.core.events import EventBus, AgentEvent
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+import time
+
+# ── Build the compiled graph ────────────────────────────────────────────
+
+
+def build_research_graph() -> Any:
+    """Construct and compile the LangGraph research workflow.
+
+    Returns:
+        A compiled LangGraph ``CompiledGraph`` with ``MemorySaver``
+        checkpointing enabled.
+    """
+    workflow = StateGraph(ResearchState)
+
+    # ── Register all agent nodes ────────────────────────────────────
+    workflow.add_node("research_retrieval", research_retrieval_node)
+    workflow.add_node("literature_review", literature_review_node)
+    workflow.add_node("citation_verification", citation_verification_node)
+    workflow.add_node("gap_analysis", gap_analysis_node)
+    workflow.add_node("methodology_suggestion", methodology_suggestion_node)
+    workflow.add_node("draft_writing", draft_writing_node)
+    workflow.add_node("hallucination_detection", hallucination_detection_node)
+    workflow.add_node("formatting", formatting_node)
+    workflow.add_node("journal_recommendation", journal_recommendation_node)
+    workflow.add_node("reviewer_simulation", reviewer_simulation_node)
+    workflow.add_node("submission_preparation", submission_preparation_node)
+
+    # ── Virtual supervisor node (conditional routing) ───────────────
+    workflow.add_node("supervisor", _supervisor_node)
+
+    # ── Entry point ────────────────────────────────────────────────
+    workflow.set_entry_point("supervisor")
+
+    # ── Conditional edges from supervisor ──────────────────────────
+    workflow.add_conditional_edges(
+        "supervisor",
+        route,
+        {
+            "research_retrieval": "research_retrieval",
+            "literature_review": "literature_review",
+            "citation_verification": "citation_verification",
+            "gap_analysis": "gap_analysis",
+            "methodology_suggestion": "methodology_suggestion",
+            "draft_writing": "draft_writing",
+            "hallucination_detection": "hallucination_detection",
+            "formatting": "formatting",
+            "journal_recommendation": "journal_recommendation",
+            "reviewer_simulation": "reviewer_simulation",
+            "submission_preparation": "submission_preparation",
+            "END": END,
+        },
+    )
+
+    # ── Every worker node feeds back into the supervisor ───────────
+    _worker_nodes = [
+        "research_retrieval",
+        "literature_review",
+        "citation_verification",
+        "gap_analysis",
+        "methodology_suggestion",
+        "draft_writing",
+        "hallucination_detection",
+        "formatting",
+        "journal_recommendation",
+        "reviewer_simulation",
+        "submission_preparation",
+    ]
+    for node_name in _worker_nodes:
+        workflow.add_edge(node_name, "supervisor")
+
+    # ── Compile with checkpointer ──────────────────────────────────
+    checkpointer = MemorySaver()
+    compiled = workflow.compile(checkpointer=checkpointer)
+
+    logger.info("graph.compiled", node_count=len(_worker_nodes) + 1)
+    return compiled
+
+
+async def _supervisor_node(state: ResearchState) -> dict[str, Any]:
+    """Thin pass-through node used as the routing hub.
+
+    The actual routing logic is in ``supervisor.route`` and is wired via
+    ``add_conditional_edges``.  This node just logs the transition.
+    """
+    logger.debug(
+        "supervisor.enter",
+        current_agent=state.get("current_agent"),
+        status=state.get("status"),
+        project_id=state.get("project_id"),
+    )
+    return {"current_agent": "supervisor"}
+
+
+# ── Convenience runner ──────────────────────────────────────────────────
+
+
+async def run_workflow(
+    topic: str,
+    project_id: str,
+    *,
+    user_preferences: dict[str, Any] | None = None,
+    max_revisions: int = 3,
+    format_style: str = "ieee",
+) -> ResearchState:
+    """Run the full research workflow end-to-end.
+
+    This is a high-level convenience function intended for services and
+    CLI scripts.  It builds the graph, prepares the initial state, and
+    invokes the compiled graph asynchronously.
+
+    Args:
+        topic: The user's research topic / question.
+        project_id: UUID of the owning project.
+        user_preferences: Optional dict of user preferences.
+        max_revisions: Maximum number of revision loops (default 3).
+        format_style: Target formatting style (default ``"ieee"``).
+
+    Returns:
+        The final ``ResearchState`` after the workflow completes.
+    """
+    workflow_start_ns = time.monotonic_ns()
+    logger.info(
+        "workflow.start",
+        topic=topic,
+        project_id=project_id,
+        max_revisions=max_revisions,
+    )
+
+    graph = build_research_graph()
+
+    initial_state: dict[str, Any] = {
+        "topic": topic,
+        "project_id": project_id,
+        "user_preferences": user_preferences or {},
+        "retrieved_papers": [],
+        "paper_embeddings_stored": False,
+        "literature_review": "",
+        "key_themes": [],
+        "citations": [],
+        "citation_verification_results": [],
+        "research_gaps": [],
+        "suggested_methodologies": [],
+        "selected_methodology": None,
+        "paper_outline": {},
+        "paper_sections": {},
+        "hallucination_report": {},
+        "formatted_paper": "",
+        "format_style": format_style,
+        "journal_recommendations": [],
+        "reviewer_feedback": [],
+        "submission_package": {},
+        "current_agent": "",
+        "agent_history": [],
+        "errors": [],
+        "status": "initialized",
+        "messages": [],
+        "revision_count": 0,
+        "max_revisions": max_revisions,
+    }
+
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        # Publish workflow start event
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="supervisor",
+                    event_type="workflow_started",
+                    project_id=project_id,
+                    data={"topic": topic, "format_style": format_style},
+                )
+            )
+        except Exception:
+            pass
+
+        final_state = await graph.ainvoke(initial_state, config=config)
+        workflow_duration_ms = (
+            time.monotonic_ns() - workflow_start_ns
+        ) / 1_000_000
+        
+        # Publish workflow completion event
+        try:
+            bus = EventBus()
+
+    
+            await bus.publish(
+                AgentEvent(
+                     agent_name="supervisor",
+                     event_type="workflow_completed",
+                     project_id=project_id,
+                     data={
+                           "status": final_state.get("status"),
+                           "agents_executed": len(
+                                      final_state.get("agent_history", [])
+                            ),
+                            "workflow_duration_ms": round(
+                                      workflow_duration_ms,
+                                           2,
+                            ),
+                        },
+                    )
+                )
+
+        except Exception:
+             pass
+
+        logger.info(
+            "workflow.complete",
+            project_id=project_id,
+            status=final_state.get("status"),
+            agents_executed=len(final_state.get("agent_history", [])),
+        )
+        return final_state  # type: ignore[return-value]
+
+    except Exception as exc:
+        logger.error(
+            "workflow.failed",
+            project_id=project_id,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        raise
+
+============================================================
+FILE: app\agents\supervisor.py
+============================================================
+"""Deterministic supervisor — routes the workflow to the next agent node.
+
+Unlike LLM-based supervisors, this module applies hard-coded routing
+rules so that the pipeline is **reproducible**, **auditable**, and
+**fast**.  Every routing decision is logged via structlog.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+from typing import Literal
+
+from app.agents.state import ResearchState
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# ── Valid node names ────────────────────────────────────────────────────
+_NODE_NAMES = Literal[
+    "research_retrieval",
+    "literature_review",
+    "citation_verification",
+    "gap_analysis",
+    "methodology_suggestion",
+    "draft_writing",
+    "hallucination_detection",
+    "formatting",
+    "journal_recommendation",
+    "reviewer_simulation",
+    "submission_preparation",
+    "END",
+]
+
+
+def _avg_reviewer_score(feedback: list[dict]) -> float:
+    """Compute average score from reviewer feedback dicts.
+
+    Each dict is expected to carry a ``"score"`` key with a numeric
+    value.  Missing / non-numeric entries are silently skipped.
+    """
+    scores: list[float] = []
+    for entry in feedback:
+        try:
+            scores.append(float(entry["score"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _hallucination_score(report: dict) -> float:
+    """Extract the hallucination score from a report dict.
+
+    Falls back to ``0.0`` if the key is absent or non-numeric.
+    """
+    try:
+        return float(report.get("score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def route(state: ResearchState) -> str:
+    """Determine the next node to execute based on the current state.
+
+    The routing rules are evaluated **in order**.  The first matching rule
+    wins.
+
+    Args:
+        state: The current workflow state.
+
+    Returns:
+        Name of the next LangGraph node (or ``"END"``).
+    """
+
+    retrieved_papers = state.get("retrieved_papers") or []
+    literature_review = state.get("literature_review") or ""
+    citation_results = state.get("citation_verification_results") or []
+    research_gaps = state.get("research_gaps") or []
+    suggested_meths = state.get("suggested_methodologies") or []
+    selected_meth = state.get("selected_methodology")
+    paper_sections = state.get("paper_sections") or {}
+    hallucination_report = state.get("hallucination_report") or {}
+    formatted_paper = state.get("formatted_paper") or ""
+    journal_recs = state.get("journal_recommendations") or []
+    reviewer_fb = state.get("reviewer_feedback") or []
+    submission_pkg = state.get("submission_package") or {}
+    revision_count = state.get("revision_count", 0)
+    max_revisions = state.get("max_revisions", 3)
+
+    next_node: str
+
+    # 1. No papers → retrieval
+    if not retrieved_papers:
+        next_node = "research_retrieval"
+
+    # 2. Papers but no review
+    elif not literature_review:
+        next_node = "literature_review"
+
+    # 3. Review exists but citations not verified
+    elif not citation_results:
+        next_node = "citation_verification"
+
+    # 4. Citations verified but no gap analysis
+    elif not research_gaps: 
+        next_node = "gap_analysis"
+
+    # 5. Gaps found but no methodology suggested
+    elif not suggested_meths and selected_meth is None:
+        next_node = "methodology_suggestion"
+
+    # 6. Methodology selected but no draft
+    elif not paper_sections:
+        next_node = "draft_writing"
+
+    # 7. Draft exists but not checked for hallucinations
+    elif not hallucination_report:
+        next_node = "hallucination_detection"
+
+    # 8. Hallucination score too high → revise draft (max 3 times)
+    elif (
+        _hallucination_score(hallucination_report) > 0.3
+        and revision_count < 3
+    ):
+        next_node = "draft_writing"
+
+    # 9. Hallucination OK but not formatted
+    elif not formatted_paper:
+        next_node = "formatting"
+
+    # 10. Formatted but no journal recommendations
+    elif not journal_recs:
+        next_node = "journal_recommendation"
+
+    # 11. Journals recommended but no reviews yet
+    elif not reviewer_fb:
+        next_node = "reviewer_simulation"
+
+    # 12. Low review score → revise (within max_revisions budget)
+    elif _avg_reviewer_score(reviewer_fb) < 6.0 and revision_count < max_revisions:
+        next_node = "draft_writing"
+
+    # 13. Reviews OK but no submission package
+    elif not submission_pkg:
+        next_node = "submission_preparation"
+
+    # 14. Everything complete
+    else:
+        next_node = "END"
+
+    _reason = _describe_reason(next_node, state)
+
+    logger.info(
+        "supervisor.route",
+        next_node=next_node,
+        revision_count=revision_count,
+        reason=_reason,
+        project_id=state.get("project_id"),
+    )
+
+    return next_node
+
+
+def _describe_reason(next_node: str, state: ResearchState) -> str:
+    """Return a human-readable reason for the routing decision."""
+    reasons: dict[str, str] = {
+        "research_retrieval": "No papers retrieved yet",
+        "literature_review": "Papers retrieved; literature review pending",
+        "citation_verification": "Literature review done; citations unverified",
+        "gap_analysis": "Citations verified; gap analysis pending",
+        "methodology_suggestion": "Gaps identified; methodology suggestion pending",
+        "draft_writing": _draft_writing_reason(state),
+        "hallucination_detection": "Draft exists; hallucination check pending",
+        "formatting": "Hallucination check passed; formatting pending",
+        "journal_recommendation": "Paper formatted; journal recommendation pending",
+        "reviewer_simulation": "Journals recommended; reviewer simulation pending",
+        "submission_preparation": "Reviews satisfactory; submission preparation pending",
+        "END": "Submission package ready — workflow complete",
+    }
+    return reasons.get(next_node, "Unknown")
+
+
+def _draft_writing_reason(state: ResearchState) -> str:
+    """Determine why the draft_writing node is being invoked."""
+    hallucination_report = state.get("hallucination_report") or {}
+    reviewer_fb = state.get("reviewer_feedback") or []
+    revision_count = state.get("revision_count", 0)
+
+    h_score = _hallucination_score(hallucination_report)
+    if h_score > 0.3:
+        return (
+            f"Hallucination score {h_score:.2f} > 0.3; "
+            f"revision {revision_count + 1}"
+        )
+
+    avg = _avg_reviewer_score(reviewer_fb)
+    if reviewer_fb and avg < 6.0:
+        return (
+            f"Avg reviewer score {avg:.1f} < 6.0; "
+            f"revision {revision_count + 1}"
+        )
+
+    return "Methodology selected; initial draft pending"
+
+============================================================
+FILE: app\agents\state.py
+============================================================
+"""ResearchState — LangGraph shared state definition.
+
+Defines the typed dictionary that flows through every node in the
+multi-agent research workflow graph.  Annotated fields use LangGraph
+reducers so that successive node outputs are *merged* rather than
+overwritten (e.g. ``messages`` uses ``add_messages``).
+"""
+
+from __future__ import annotations
+
+import operator
+from typing import Annotated, TypedDict
+
+# pyrefly: ignore [missing-import]
+from langgraph.graph.message import add_messages
+
+
+def _append_list(existing: list, new: list) -> list:
+    """Reducer that appends new items to an existing list."""
+    if existing is None:
+        existing = []
+    if new is None:
+        new = []
+    return existing + new
+
+
+class ResearchState(TypedDict, total=False):
+    """Shared state passed between all LangGraph nodes.
+
+    Fields annotated with a reducer are *accumulated* across node calls.
+    All other fields are overwritten by the latest node output.
+
+    Attributes:
+        topic: The research topic / question supplied by the user.
+        project_id: UUID of the owning project.
+        user_preferences: Free-form dict of user-specified preferences
+            (e.g. target journal, language style).
+        retrieved_papers: Papers returned by the retrieval node.
+        paper_embeddings_stored: Whether the paper vectors have been
+            persisted to the vector store.
+        literature_review: Markdown text of the synthesised literature
+            review.
+        key_themes: High-level themes extracted from the literature.
+        citations: Structured citation objects used throughout the paper.
+        citation_verification_results: Per-citation verification verdicts.
+        research_gaps: Identified gaps in the existing literature.
+        suggested_methodologies: Methodologies suggested by the gap
+            analysis agent.
+        selected_methodology: The methodology chosen for the paper.
+        paper_outline: Hierarchical outline dict for the paper.
+        paper_sections: Mapping of section title → Markdown body text.
+        hallucination_report: Results from hallucination detection.
+        formatted_paper: Final formatted paper text (LaTeX / Markdown).
+        format_style: Desired formatting style (e.g. ``"ieee"``,
+            ``"apa"``).
+        journal_recommendations: Ranked list of suitable journals.
+        reviewer_feedback: Simulated reviewer comments / scores.
+        submission_package: Metadata + artefacts for journal submission.
+        current_agent: Name of the agent currently executing.
+        agent_history: Append-only log of agent execution records.
+        errors: Append-only list of error dicts.
+        status: Current workflow status string.
+        messages: LangGraph chat messages (accumulated via
+            ``add_messages``).
+        revision_count: How many revision loops have occurred.
+        max_revisions: Upper bound on revision loops.
+    """
+
+    # ── User inputs ──────────────────────────────────────────────
+    topic: str
+    project_id: str
+    user_preferences: dict
+
+    # ── Retrieval ────────────────────────────────────────────────
+    retrieved_papers: list[dict]
+    paper_embeddings_stored: bool
+
+    # ── Literature review ────────────────────────────────────────
+    literature_review: str
+    key_themes: list[str]
+
+    # ── Citations ────────────────────────────────────────────────
+    citations: list[dict]
+    citation_verification_results: list[dict]
+
+    # ── Gap analysis ─────────────────────────────────────────────
+    research_gaps: list[dict]
+    gap_analysis_completed: bool
+
+    # ── Methodology ──────────────────────────────────────────────
+    suggested_methodologies: list[dict]
+    selected_methodology: dict | None
+
+    # ── Paper drafting ───────────────────────────────────────────
+    paper_outline: dict
+    paper_sections: dict[str, str]
+
+    # ── Hallucination detection ──────────────────────────────────
+    hallucination_report: dict
+
+    # ── Formatting ───────────────────────────────────────────────
+    formatted_paper: str
+    format_style: str
+
+    # ── Journal & review ─────────────────────────────────────────
+    journal_recommendations: list[dict]
+    reviewer_feedback: list[dict]
+
+    # ── Submission ───────────────────────────────────────────────
+    submission_package: dict
+
+    # ── Workflow meta ────────────────────────────────────────────
+    current_agent: str
+    agent_history: Annotated[list[dict], _append_list]
+    errors: Annotated[list[dict], _append_list]
+    status: str
+    messages: Annotated[list, add_messages]
+
+    # ── Revision control ─────────────────────────────────────────
+    revision_count: int
+    max_revisions: int
+
+============================================================
+FILE: app\agents\nodes\research_retrieval.py
+============================================================
+"""Research retrieval node for the LangGraph workflow.
+
+This node is responsible for:
+1.  Formulating multiple diverse search queries from the research topic.
+2.  Querying arXiv, Semantic Scholar, and CrossRef **in parallel**.
+3.  Deduplicating results by DOI / normalised title.
+4.  Ranking papers by citation count × relevance.
+5.  Indexing papers into the Pinecone vector store via the RAG pipeline.
+6.  Publishing agent events via the EventBus.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as _dt
+import hashlib
+import json
+import re
+from typing import Any
+
+from app.agents.state import ResearchState
+from app.core.events import EventBus, AgentEvent
+from app.integrations.arxiv_client import ArxivClient
+from app.integrations.semantic_scholar_client import SemanticScholarClient
+from app.integrations.crossref_client import CrossRefClient
+from app.rag.embeddings import EmbeddingGenerator
+from app.rag.vectorstore import VectorStore
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+_STOP_WORDS = frozenset(
+    {"a", "an", "the", "of", "and", "in", "to", "for", "on", "with", "is", "at", "by"}
+)
+
+
+def _normalise_title(title: str) -> str:
+    """Lower-case, strip punctuation and stop-words for dedup matching."""
+    title = title.lower().strip()
+    title = re.sub(r"[^a-z0-9\s]", "", title)
+    tokens = [t for t in title.split() if t not in _STOP_WORDS]
+    return " ".join(tokens)
+
+
+def _title_hash(title: str) -> str:
+    return hashlib.md5(_normalise_title(title).encode()).hexdigest()
+
+
+def _generate_queries(topic: str) -> list[str]:
+    """Generate 3-5 diverse search query variants from a topic string.
+
+    We apply simple heuristic transformations so the retrieval node can
+    work even without an LLM call.
+    """
+    queries: list[str] = [topic]
+
+    # Broader variant
+    broad = re.sub(r"\b(using|via|with|based on)\b", "", topic, flags=re.I).strip()
+    if broad and broad != topic:
+        queries.append(broad)
+
+    # More specific: add "survey" / "review"
+    queries.append(f"{topic} survey review")
+
+    # Methodological variant
+    queries.append(f"{topic} methods approaches techniques")
+
+    # Recent advances
+    queries.append(f"recent advances {topic}")
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for q in queries:
+        q_norm = q.lower().strip()
+        if q_norm not in seen:
+            seen.add(q_norm)
+            unique.append(q)
+
+    return unique[:5]
+
+
+def _deduplicate_papers(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate papers by DOI first, then by normalised title hash."""
+    seen_dois: set[str] = set()
+    seen_titles: set[str] = set()
+    unique: list[dict[str, Any]] = []
+
+    for paper in papers:
+        doi = (paper.get("doi") or "").strip().lower()
+        t_hash = _title_hash(paper.get("title", ""))
+
+        if doi and doi in seen_dois:
+            continue
+        if t_hash in seen_titles:
+            continue
+
+        if doi:
+            seen_dois.add(doi)
+        seen_titles.add(t_hash)
+        unique.append(paper)
+
+    return unique
+
+
+def _rank_papers(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank papers by citation count (descending), breaking ties by year."""
+    return sorted(
+        papers,
+        key=lambda p: (
+            -(p.get("citation_count") or 0),
+            -(p.get("year") or 0),
+        ),
+    )
+
+
+# ── Source search helpers ───────────────────────────────────────────────
+
+
+async def _search_arxiv(query: str, max_results: int) -> list[dict[str, Any]]:
+    """Search arXiv, returning normalised paper dicts."""
+    try:
+        client = ArxivClient()
+        raw = await client.search(query=query, max_results=max_results)
+        results: list[dict[str, Any]] = []
+        for p in raw:
+            results.append(
+                {
+                    "title": p.title,
+                    "authors": p.authors,
+                    "abstract": p.abstract,
+                    "year": p.published.year if p.published else None,
+                    "doi": p.doi,
+                    "arxiv_id": p.id,
+                    "source": "arxiv",
+                    "citation_count": 0,
+                    "url": p.pdf_url,
+                }
+            )
+        return results
+    except Exception as exc:
+        logger.error(".arxiv_error", error=str(exc), query=query)
+        return []
+
+
+async def _search_semantic_scholar(
+    query: str, max_results: int
+) -> list[dict[str, Any]]:
+    """Search Semantic Scholar, returning normalised paper dicts."""
+    try:
+        client = SemanticScholarClient()
+        raw = await client.search(query=query, limit=max_results)
+        results: list[dict[str, Any]] = []
+        for p in raw:
+            results.append(
+                {
+                    "title": p.title,
+                    "authors": [
+                        a.get("name", a) if isinstance(a, dict) else str(a)
+                        for a in p.authors
+                    ],
+                    "abstract": p.abstract or "",
+                    "year": p.year,
+                    "doi": p.doi or p.externalIds.get("DOI"),
+                    "semantic_scholar_id": p.paperId,
+                    "source": "semantic_scholar",
+                    "citation_count": p.citationCount,
+                    "url": p.url,
+                }
+            )
+        return results
+    except Exception as exc:
+        logger.error(
+            ".semantic_scholar_error",
+            error=str(exc),
+            query=query,
+        )
+        return []
+
+
+async def _search_crossref(query: str, max_results: int) -> list[dict[str, Any]]:
+    """Search CrossRef, returning normalised paper dicts."""
+    try:
+        client = CrossRefClient()
+        raw = await client.search(query=query, rows=max_results)
+        results: list[dict[str, Any]] = []
+        for w in raw:
+            year = None
+            if w.published_date:
+                try:
+                    year = int(w.published_date.split("-")[0])
+                except (ValueError, IndexError):
+                    pass
+
+            results.append(
+                {
+                    "title": w.title,
+                    "authors": [
+                        f"{a.get('given', '')} {a.get('family', '')}".strip()
+                        for a in w.authors
+                    ],
+                    "abstract": w.abstract or "",
+                    "year": year,
+                    "doi": w.doi,
+                    "source": "crossref",
+                    "citation_count": w.is_referenced_by_count,
+                    "url": w.url,
+                }
+            )
+        return results
+    except Exception as exc:
+        logger.error(
+            ".crossref_error", error=str(exc), query=query
+        )
+        return []
+
+
+# ── Embedding helper ────────────────────────────────────────────────────
+
+
+async def _index_papers(
+    papers: list[dict[str, Any]], project_id: str
+) -> bool:
+    """Embed and upsert papers into the vector store.
+
+    Returns ``True`` on success, ``False`` on failure.
+    """
+    if not papers:
+        return True
+
+    try:
+        embedder = EmbeddingGenerator()
+        store = VectorStore()
+
+        texts: list[str] = []
+        metadatas: list[dict[str, Any]] = []
+
+        for paper in papers:
+            # Combine title + abstract for embedding
+            text = f"{paper.get('title', '') or ''}\n\n{paper.get('abstract', '') or ''}"
+            texts.append(text)
+            metadatas.append(
+                {
+                    "paper_title": paper.get("title", "") or "",
+                    "doi": paper.get("doi", "") or "",
+                    "authors": [str(a) for a in (paper.get("authors") or [])],
+                    "year": paper.get("year") or "",
+                    "source": paper.get("source", "") or "",
+                    "project_id": project_id,
+                }
+            )
+
+        logger.info(
+            ".embedding_start",
+            paper_count=len(texts),
+        )
+
+        vectors = await embedder.generate(texts)
+
+        logger.info(
+            ".embedding_complete",
+            vectors=len(vectors),
+        )
+
+        def sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+            cleaned: dict[str, Any] = {}
+
+            for key, value in metadata.items():
+
+                if value is None:
+                    cleaned[key] = ""
+
+                elif isinstance(value, (str, int, float, bool)):
+                    cleaned[key] = value
+
+                elif isinstance(value, list):
+                    cleaned[key] = [str(v) for v in value if v is not None]
+
+                else:
+                    cleaned[key] = str(value)
+
+            return cleaned
+            
+        chunks_with_embeddings = []
+
+        for i, (vector, text, metadata) in enumerate(
+            zip(vectors, texts, metadatas)
+        ):
+            safe_metadata = sanitize_metadata(
+                {
+                    **metadata,
+                    "chunk_text": text[:1000],
+                }
+            )
+
+            chunks_with_embeddings.append(
+                {
+                    "id": f"{project_id}-{i}",
+                    "values": vector,
+                    "metadata": safe_metadata,
+                }
+            )
+
+        logger.info(
+            ".upsert_ready",
+            vectors=len(chunks_with_embeddings),
+        )
+        count = await store.index_chunks(chunks_with_embeddings)
+
+        logger.info(
+            ".indexed_papers",
+            count=count,
+            project_id=project_id,
+        )
+        return True
+
+    except Exception as exc:
+        logger.error(
+            ".index_error",
+            error=str(exc),
+            project_id=project_id,
+        )
+        return False
+
+
+# ── Main node function ──────────────────────────────────────────────────
+
+
+async def _node(state: ResearchState) -> dict[str, Any]:
+    """LangGraph node: retrieve and index academic papers.
+
+    Args:
+        state: The current workflow state.
+
+    Returns:
+        A dict of state updates containing ``retrieved_papers``,
+        ``paper_embeddings_stored``, ``current_agent``, ``agent_history``,
+        and ``status``.
+    """
+    topic: str = state.get("topic", "")
+    project_id: str = state.get("project_id", "")
+    start_time = _dt.datetime.now(_dt.timezone.utc)
+
+    logger.info(
+        "research_retrieval.start",
+        topic=topic,
+        project_id=project_id,
+    )
+
+    # Publish start event
+    try:
+        logger.info("research_retrieval.publishing_start_event", project_id=project_id)
+        event_bus = EventBus()
+        await event_bus.publish(
+            AgentEvent(
+                agent_name="research_retrieval",
+                event_type="agent_started",
+                project_id=project_id,
+                data={"topic": topic},
+            )
+        )
+        logger.info("research_retrieval.published_start_event", project_id=project_id)
+    except Exception as exc:
+        logger.warning("research_retrieval.event_publish_failed", error=str(exc))
+
+    errors: list[dict[str, Any]] = []
+
+    # 1. Generate search queries
+    queries = _generate_queries(topic)
+    logger.info("research_retrieval.queries", queries=queries)
+
+    # 2. Search all sources in parallel for each query
+    per_query_limit = 15
+    search_coros: list[Any] = []
+    for q in queries:
+        search_coros.append(_search_arxiv(q, per_query_limit))
+        search_coros.append(_search_semantic_scholar(q, per_query_limit))
+        search_coros.append(_search_crossref(q, per_query_limit))
+
+    logger.info("research_retrieval.initiating_parallel_searches", coro_count=len(search_coros))
+    all_results = await asyncio.gather(*search_coros, return_exceptions=True)
+    logger.info("research_retrieval.parallel_searches_completed", result_count=len(all_results))
+
+    # Flatten, skipping exceptions
+    all_papers: list[dict[str, Any]] = []
+    for result in all_results:
+        if isinstance(result, BaseException):
+            logger.error("research_retrieval.search_coroutine_failed", error=str(result))
+            errors.append(
+                {
+                    "agent": "research_retrieval",
+                    "error": str(result),
+                    "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                }
+            )
+            continue
+        if isinstance(result, list):
+            all_papers.extend(result)
+
+    logger.info(
+        "research_retrieval.raw_count",
+        raw_count=len(all_papers),
+    )
+
+    # 3. Deduplicate
+    unique_papers = _deduplicate_papers(all_papers)
+    logger.info(
+        "research_retrieval.dedup_count",
+        dedup_count=len(unique_papers),
+    )
+
+    # 4. Rank
+    ranked_papers = _rank_papers(unique_papers)
+
+    # 5. Index into vector store
+    logger.info("research_retrieval.starting_indexing", paper_count=len(ranked_papers))
+    embeddings_stored = await _index_papers(ranked_papers, project_id)
+    logger.info("research_retrieval.indexing_completed", success=embeddings_stored)
+
+    elapsed = (_dt.datetime.now(_dt.timezone.utc) - start_time).total_seconds()
+
+    # Publish completion event
+    try:
+        logger.info("research_retrieval.publishing_completion_event", project_id=project_id)
+        event_bus = EventBus()
+        await event_bus.publish(
+            AgentEvent(
+                agent_name="research_retrieval",
+                event_type="agent_completed",
+                project_id=project_id,
+                data={
+                    "paper_count": len(ranked_papers),
+                    "embeddings_stored": embeddings_stored,
+                    "elapsed_seconds": elapsed,
+                },
+            )
+        )
+        logger.info("research_retrieval.published_completion_event", project_id=project_id)
+    except Exception as exc:
+        logger.warning("research_retrieval.event_publish_failed", error=str(exc))
+
+    logger.info(
+        "research_retrieval.complete",
+        paper_count=len(ranked_papers),
+        embeddings_stored=embeddings_stored,
+        elapsed_seconds=elapsed,
+    )
+
+    return {
+        "retrieved_papers": ranked_papers,
+        "paper_embeddings_stored": embeddings_stored,
+        "current_agent": "",
+        "agent_history": [
+            {
+                "agent": "research_retrieval",
+                "status": "completed",
+                "paper_count": len(ranked_papers),
+                "queries_used": queries,
+                "elapsed_seconds": elapsed,
+                "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            }
+        ],
+        "errors": errors,
+        "status": "papers_retrieved",
+    }
+
+# LangGraph export
+research_retrieval_node = _node
+    
+
+============================================================
+FILE: app\services\research_service.py
+============================================================
+"""Research workflow orchestration service.
+
+Manages the lifecycle of a LangGraph research workflow:
+start, pause, resume, cancel, and status queries.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+import datetime as _dt
+from typing import Any
+import traceback
+from app.agents.graph import build_research_graph, run_workflow
+from app.core.events import EventBus, AgentEvent
+from app.core.exceptions import NotFoundError, WorkflowError
+from app.models.database import Project, get_async_session
+from app.models.schemas import ResearchStartRequest, ResearchStatusResponse
+from app.services.project_service import ProjectService
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+# ── In-memory workflow registry ────────────────────────────────────────
+# Maps project_id → workflow metadata.  In production, replace with
+# Redis or a proper task queue (Celery, ARQ, etc.).
+
+_active_workflows: dict[str, dict[str, Any]] = {}
+
+
+class ResearchService:
+    """Orchestrates the multi-agent research workflow lifecycle."""
+
+    # ── START ───────────────────────────────────────────────────────
+
+    @staticmethod
+    async def start_research(
+        project_id: str,
+        request: ResearchStartRequest,
+    ) -> str:
+        """Launch a new research workflow as a background task.
+
+        Args:
+            project_id: UUID of the owning project.
+            request: The research start request payload containing topic
+                and optional preferences.
+
+        Returns:
+            A unique ``workflow_id`` string.
+
+        Raises:
+            NotFoundError: If the project does not exist.
+            WorkflowError: If a workflow is already running for this project.
+        """
+        # Validate project exists
+        project = await ProjectService.get_project(project_id)
+        topic = (
+           request.search_queries[0]
+           if getattr(request, "search_queries", None)
+           else project.topic or ""
+        )
+
+        # Prevent duplicate workflows
+        if project_id in _active_workflows:
+            existing = _active_workflows[project_id]
+            if existing.get("status") in ("running", "paused"):
+                raise WorkflowError(
+                    f"A workflow is already {existing['status']} for project "
+                    f"{project_id}. Cancel it first."
+                )
+
+        workflow_id = str(uuid.uuid4())
+
+        # Register the workflow
+        _active_workflows[project_id] = {
+            "workflow_id": workflow_id,
+            "project_id": project_id,
+            "topic": topic,
+            "status": "running",
+            "started_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "task": None,
+            "cancel_event": asyncio.Event(),
+            "current_agent": "research_retrieval",
+            "progress_pct": 0.0,
+        }
+
+
+        # Update project status
+        async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+            proj = result.scalar_one_or_none()
+            if proj is not None:
+                proj.status = "researching"
+                proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+                await session.commit()
+
+        # Publish start event
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_started",
+                    project_id=project_id,
+                    data={
+                        "workflow_id": workflow_id,
+                        "topic": project.topic or "",
+                    },
+                )
+            )
+        except Exception:
+            logger.warning("research_service.event_publish_failed")
+
+        # Launch as background task
+        task = asyncio.create_task(
+            _run_workflow_task(
+                workflow_id=workflow_id,
+
+                project_id=project_id,
+                topic=topic,
+                user_preferences=getattr(request, "user_preferences", None) or {},
+                max_revisions=getattr(request, "max_revisions", 3),
+                format_style=getattr(request, "format_style", "ieee"),
+            )
+        )
+        _active_workflows[project_id]["task"] = task
+
+        logger.info(
+            "research_service.started",
+            project_id=project_id,
+            workflow_id=workflow_id,
+            topic=topic,
+        )
+        return workflow_id
+
+    # ── STATUS ──────────────────────────────────────────────────────
+
+    @staticmethod
+    async def get_research_status(project_id: str) -> ResearchStatusResponse:
+        """Get the current status of a project's research workflow.
+
+        Args:
+            project_id: UUID of the project.
+
+        Returns:
+            A ``ResearchStatusResponse`` with current state information.
+
+        Raises:
+            NotFoundError: If no workflow has been started for this project.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow found for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        return ResearchStatusResponse(
+            project_id=project_id,
+            status=wf.get("status", "unknown"),
+            started_at=wf.get("started_at"),
+            current_agent=wf.get("current_agent"),
+            progress_pct=wf.get("progress_pct", 0.0),
+            completed_at=wf.get("completed_at"),
+            error=wf.get("error"),
+        )
+
+    # ── PAUSE ───────────────────────────────────────────────────────
+
+    @staticmethod
+    async def pause_research(project_id: str) -> None:
+        """Pause a running research workflow.
+
+        The current node will finish execution, but no new nodes will be
+        dispatched until ``resume_research`` is called.
+
+        Args:
+            project_id: UUID of the project.
+
+        Raises:
+            NotFoundError: If no workflow is active.
+            WorkflowError: If the workflow is not in a pausable state.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        if wf["status"] != "running":
+            raise WorkflowError(
+                f"Cannot pause workflow in state '{wf['status']}'"
+            )
+
+        wf["status"] = "paused"
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_paused",
+                    project_id=project_id,
+                    data={"workflow_id": wf["workflow_id"]},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.paused",
+            project_id=project_id,
+            workflow_id=wf["workflow_id"],
+        )
+
+    # ── RESUME ──────────────────────────────────────────────────────
+
+    @staticmethod
+    async def resume_research(project_id: str) -> None:
+        """Resume a paused research workflow.
+
+        Args:
+            project_id: UUID of the project.
+
+        Raises:
+            NotFoundError: If no workflow is active.
+            WorkflowError: If the workflow is not paused.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        if wf["status"] != "paused":
+            raise WorkflowError(
+                f"Cannot resume workflow in state '{wf['status']}'"
+            )
+
+        wf["status"] = "running"
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_resumed",
+                    project_id=project_id,
+                    data={"workflow_id": wf["workflow_id"]},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.resumed",
+            project_id=project_id,
+            workflow_id=wf["workflow_id"],
+        )
+
+    # ── CANCEL ──────────────────────────────────────────────────────
+
+    @staticmethod
+    async def cancel_research(project_id: str) -> None:
+        """Cancel a running or paused research workflow.
+
+        Args:
+            project_id: UUID of the project.
+
+        Raises:
+            NotFoundError: If no workflow is active.
+            WorkflowError: If the workflow has already completed.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        if wf["status"] in ("completed", "failed"):
+            raise WorkflowError(
+                f"Workflow already in terminal state '{wf['status']}'"
+            )
+
+        # Signal cancellation
+        cancel_event: asyncio.Event | None = wf.get("cancel_event")
+        if cancel_event:
+            cancel_event.set()
+
+        # Cancel the asyncio Task if running
+        task: asyncio.Task | None = wf.get("task")
+        if task and not task.done():
+            task.cancel()
+
+        wf["status"] = "cancelled"
+        wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        # Update project status
+        async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+            proj = result.scalar_one_or_none()
+            if proj is not None:
+                proj.status = "cancelled"
+                proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+                await session.commit()
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_cancelled",
+                    project_id=project_id,
+                    data={"workflow_id": wf["workflow_id"]},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.cancelled",
+            project_id=project_id,
+            workflow_id=wf["workflow_id"],
+        )
+
+
+# ── Background task ────────────────────────────────────────────────────
+
+
+async def _run_workflow_task(
+    *,
+    workflow_id: str,
+    project_id: str,
+    topic: str,
+    user_preferences: dict[str, Any],
+    max_revisions: int,
+    format_style: str,
+) -> None:
+    """Run the LangGraph workflow inside a background asyncio task.
+
+    Updates the in-memory workflow registry with status transitions and
+    persists the final project status to the database.
+    """
+    try:
+        logger.info(
+            "research_service.task_started",
+            workflow_id=workflow_id,
+            project_id=project_id,
+        )
+
+        final_state = await run_workflow(
+            topic=topic,
+            project_id=project_id,
+            user_preferences=user_preferences,
+            max_revisions=max_revisions,
+            format_style=format_style,
+        )
+
+        # Update workflow metadata
+        if project_id in _active_workflows:
+            wf = _active_workflows[project_id]
+            wf["status"] = "completed"
+            wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            wf["current_agent"] = final_state.get("current_agent", "")
+
+        # Update project status
+        async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+            proj = result.scalar_one_or_none()
+            if proj is not None:
+                proj.status = "completed"
+
+                logger.info(
+                    "final_state_type",
+                    type=str(type(final_state)),
+                )
+                
+                proj.workflow_state = final_state
+                proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+
+                logger.info(
+                    "research_service.saving_workflow_state",
+                    project_id=project_id,
+                    keys=list(final_state.keys()),
+                )
+
+                sections = final_state.get("paper_sections", {})
+
+                if sections:
+                    from sqlalchemy import delete
+                    from app.models.database import DocumentSection
+
+                    await session.execute(
+                        delete(DocumentSection).where(
+                            DocumentSection.project_id == project_id
+                        )
+                    )
+
+                    for order, (title, content) in enumerate(sections.items()):
+                        session.add(
+                            DocumentSection(
+                                project_id=project_id,
+                                title=title,
+                                content=content,
+                section_order=order,
+                section_type=title.lower().replace(" ", "_"),
+                word_count=len(content.split()) if content else 0,
+            )
+        )
+
+        logger.info(
+            "research_service.saved_document_sections",
+            project_id=project_id,
+            section_count=len(sections),
+        )
+
+
+        await session.commit()
+
+            
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_completed",
+                    project_id=project_id,
+                    data={"workflow_id": workflow_id},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.task_completed",
+            workflow_id=workflow_id,
+            project_id=project_id,
+        )
+
+    except asyncio.CancelledError:
+        logger.warning(
+            "research_service.task_cancelled",
+            workflow_id=workflow_id,
+            project_id=project_id,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "research_service.task_failed",
+            workflow_id=workflow_id,
+            project_id=project_id,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+
+        if project_id in _active_workflows:
+            wf = _active_workflows[project_id]
+            wf["status"] = "failed"
+            wf["error"] = str(exc)
+            wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        # Update project status
+        try:
+            async with get_async_session() as session:
+                # pyrefly: ignore [missing-import]
+                from sqlalchemy import select
+
+                result = await session.execute(
+                    select(Project).where(Project.id == project_id)
+                )
+                proj = result.scalar_one_or_none()
+                if proj is not None:
+                    proj.status = "failed"
+                    proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+                    await session.commit()
+        except Exception:
+            pass
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_failed",
+                    project_id=project_id,
+                    data={
+                        "workflow_id": workflow_id,
+                        "error": str(exc),
+                    },
+                )
+            )
+        except Exception:
+            pass
+
+============================================================
+FILE: app\core\events.py
+============================================================
+"""Redis-backed asynchronous event bus for agent coordination.
+
+Provides pub/sub over Redis channels so that agents, the orchestrator, and
+WebSocket endpoints can communicate in real-time.  When Redis is not available
+the bus logs a warning and silently drops messages instead of crashing the
+application.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from typing import Any, AsyncGenerator
+
+import structlog
+
+from app.core.constants import AgentName
+
+logger = structlog.stdlib.get_logger(__name__)
+
+# ── Data Structures ──────────────────────────────────────────────────────────
+
+AGENT_EVENTS_CHANNEL = "researchos:agent_events"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEvent:
+    """Immutable record describing a single agent lifecycle event.
+
+    Attributes:
+        project_id: UUID of the research project.
+        agent_name: Which agent emitted the event.
+        event_type: Lifecycle phase (started, progress, completed, failed, warning).
+        data: Arbitrary payload carried with the event.
+        timestamp: UNIX epoch seconds (float) when the event was created.
+        event_id: Unique identifier for this event instance.
+    """
+
+    project_id: str
+    agent_name: str
+    event_type: str
+    data: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    def to_json(self) -> str:
+        """Serialize the event to a JSON string."""
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, raw: str | bytes) -> "AgentEvent":
+        """Deserialize an event from a JSON string or bytes."""
+        payload = json.loads(raw)
+        return cls(**payload)
+
+
+# ── Event Bus ────────────────────────────────────────────────────────────────
+
+
+class EventBus:
+    """Thin wrapper around Redis Pub/Sub for agent event streaming.
+
+    Provides an in-memory pub-sub fallback when Redis is not available,
+    ensuring real-time updates still work in degraded mode.
+
+    Args:
+        redis_client: An ``redis.asyncio.Redis`` instance (or ``None``).
+        channel: Redis channel name used for all agent events.
+    """
+
+    def __init__(
+        self,
+        redis_client: Any | None = None,
+        channel: str = AGENT_EVENTS_CHANNEL,
+    ) -> None:
+        self._redis = redis_client
+        self._channel = channel
+        self._local_subscribers: list[asyncio.Queue[AgentEvent]] = []
+
+    @property
+    def redis(self) -> Any | None:
+        """Dynamically resolve the active Redis client."""
+        if self._redis is not None:
+            return self._redis
+        from app.integrations.redis_client import RedisManager
+        mgr = RedisManager()
+        if mgr.is_connected:
+            return mgr._client
+        return None
+
+    # ── Publishing ───────────────────────────────────────────────────────
+
+    async def publish(self, event: AgentEvent) -> int:
+        """Publish an ``AgentEvent`` onto the Redis channel or local queues.
+
+        Returns:
+            Number of subscribers that received the message.
+        """
+        redis_client = self.redis
+        if redis_client is None:
+            logger.warning(
+                "event_bus.publish.no_redis",
+                event_id=event.event_id,
+                agent=event.agent_name,
+                msg="Falling back to local in-memory pub/sub",
+            )
+            # In-memory local fallback
+            count = 0
+            for q in list(self._local_subscribers):
+                try:
+                    q.put_nowait(event)
+                    count += 1
+                except Exception:
+                    pass
+            return count
+
+        try:
+            receivers: int = await asyncio.wait_for(
+                redis_client.publish(
+                    self._channel,
+                    event.to_json(),
+                ),
+                timeout=5.0
+            )
+            logger.debug(
+                "event_bus.published",
+                event_id=event.event_id,
+                agent=event.agent_name,
+                event_type=event.event_type,
+                receivers=receivers,
+            )
+            return receivers
+        except asyncio.TimeoutError:
+            logger.error(
+                "event_bus.publish.timeout",
+                event_id=event.event_id,
+                agent=event.agent_name,
+                timeout=5.0,
+            )
+            return 0
+        except Exception:
+            logger.exception(
+                "event_bus.publish.error",
+                event_id=event.event_id,
+                agent=event.agent_name,
+            )
+            return 0
+
+    # ── Subscribing ──────────────────────────────────────────────────────
+
+    async def subscribe(
+        self,
+        *,
+        project_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> AsyncGenerator[AgentEvent, None]:
+        """Yield ``AgentEvent`` objects as they arrive on the channel.
+
+        Optionally filter by ``project_id`` and/or ``agent_name`` so that
+        consumers only see events relevant to them.
+
+        Yields:
+            AgentEvent instances matching the optional filters.
+        """
+        redis_client = self.redis
+        if redis_client is None:
+            logger.warning(
+                "event_bus.subscribe.no_redis",
+                msg="Falling back to local in-memory subscription",
+            )
+            q = asyncio.Queue()
+            self._local_subscribers.append(q)
+            try:
+                while True:
+                    event = await q.get()
+                    # Apply optional filters
+                    if project_id and event.project_id != project_id:
+                        continue
+                    if agent_name and event.agent_name != agent_name:
+                        continue
+                    yield event
+            except asyncio.CancelledError:
+                logger.info("event_bus.subscribe.local_cancelled")
+            finally:
+                if q in self._local_subscribers:
+                    self._local_subscribers.remove(q)
+            return
+
+        pubsub = redis_client.pubsub()
+        try:
+            await pubsub.subscribe(self._channel)
+            logger.info(
+                "event_bus.subscribed",
+                channel=self._channel,
+                project_filter=project_id,
+                agent_filter=agent_name,
+            )
+
+            while True:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=1.0,
+                )
+                if message is None:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                raw_data = message.get("data")
+                if raw_data is None:
+                    continue
+
+                try:
+                    event = AgentEvent.from_json(raw_data)
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    logger.warning(
+                        "event_bus.subscribe.bad_message",
+                        raw=str(raw_data)[:200],
+                    )
+                    continue
+
+                # Apply optional filters
+                if project_id and event.project_id != project_id:
+                    continue
+                if agent_name and event.agent_name != agent_name:
+                    continue
+
+                yield event
+        except asyncio.CancelledError:
+            logger.info("event_bus.subscribe.cancelled")
+        except Exception:
+            logger.exception("event_bus.subscribe.error")
+        finally:
+            await pubsub.unsubscribe(self._channel)
+            await pubsub.close()
+
+
+# ── Module-Level Helpers ─────────────────────────────────────────────────────
+
+_bus: EventBus | None = None
+
+
+def init_event_bus(redis_client: Any | None = None) -> EventBus:
+    """Create or replace the module-level ``EventBus`` singleton.
+
+    Call this during application startup once the Redis connection is
+    established.
+    """
+    global _bus
+    _bus = EventBus(redis_client=redis_client)
+    return _bus
+
+
+def get_event_bus() -> EventBus:
+    """Return the current ``EventBus`` singleton.
+
+    If the bus has not been initialised yet, a degraded (no-Redis) instance is
+    returned so that callers never get ``None``.
+    """
+    global _bus
+    if _bus is None:
+        _bus = EventBus()
+    return _bus
+
+
+async def publish_agent_event(
+    project_id: str,
+    agent_name: str | AgentName,
+    event_type: str,
+    data: dict[str, Any] | None = None,
+) -> int:
+    """Convenience helper to publish an agent event via the global bus.
+
+    Args:
+        project_id: UUID string of the research project.
+        agent_name: Agent that is emitting the event.
+        event_type: Lifecycle phase (e.g. ``started``, ``completed``).
+        data: Optional payload dict.
+
+    Returns:
+        Number of subscribers that received the message.
+    """
+    event = AgentEvent(
+        project_id=project_id,
+        agent_name=str(agent_name),
+        event_type=event_type,
+        data=data or {},
+    )
+    bus = get_event_bus()
+    return await bus.publish(event)
+
+
+async def subscribe_agent_events(
+    *,
+    project_id: str | None = None,
+    agent_name: str | None = None,
+) -> AsyncGenerator[AgentEvent, None]:
+    """Convenience helper to subscribe to agent events via the global bus.
+
+    Args:
+        project_id: Only yield events for this project (optional).
+        agent_name: Only yield events from this agent (optional).
+
+    Yields:
+        ``AgentEvent`` objects matching the filters.
+    """
+    bus = get_event_bus()
+    async for event in bus.subscribe(
+        project_id=project_id,
+        agent_name=agent_name,
+    ):
+        yield event
+
+============================================================
+FILE: app\services\event_service.py
+============================================================
+from __future__ import annotations
+
+from app.websockets.broadcaster import publish_global
+from app.websockets.events import (
+    WorkflowStartedEvent,
+    WorkflowProgressEvent,
+    WorkflowCompletedEvent,
+)
+
+
+class EventService:
+    def __init__(self, project_id: str):
+        self.project_id = project_id
+
+    async def workflow_started(
+        self,
+        topic: str,
+        total_agents: int,
+        initiated_by: str,
+    ):
+        event = WorkflowStartedEvent(
+            project_id=self.project_id,
+            topic=topic,
+            total_agents=total_agents,
+            initiated_by=initiated_by,
+        )
+
+        await publish_global(event.to_ws_payload())
+
+    async def workflow_progress(
+        self,
+        current_agent: str,
+        completed_agents: int,
+        total_agents: int,
+        message: str,
+    ):
+        percent = (
+            completed_agents / max(total_agents, 1)
+        ) * 100
+
+        event = WorkflowProgressEvent(
+            project_id=self.project_id,
+            current_agent=current_agent,
+            completed_agents=completed_agents,
+            total_agents=total_agents,
+            percent_complete=percent,
+            message=message,
+        )
+
+        await publish_global(event.to_ws_payload())
+
+    async def workflow_completed(
+        self,
+        duration_seconds: float,
+        papers_retrieved: int,
+        sections_generated: int,
+        tokens_used: int,
+    ):
+        event = WorkflowCompletedEvent(
+            project_id=self.project_id,
+            duration_seconds=duration_seconds,
+            papers_retrieved=papers_retrieved,
+            sections_generated=sections_generated,
+            tokens_used=tokens_used,
+        )
+
+        await publish_global(event.to_ws_payload())
+
+============================================================
+FILE: app\websockets\broadcaster.py
+============================================================
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+
+from app.integrations.redis_client import RedisManager
+from app.websockets.connection_manager import manager
+
+logger = logging.getLogger(__name__)
+
+CHANNEL_PREFIX_PROJECT = "ws:project:"
+CHANNEL_GLOBAL = "ws:global"
+
+
+class RedisSubscriberTask:
+    def __init__(self):
+        self.redis = RedisManager()
+        self.task = None
+        self.running = False
+
+    async def start(self):
+        self.running = True
+
+        await self.redis.connect()
+
+        self.task = asyncio.create_task(
+            self._listen(),
+            name="redis-websocket-subscriber",
+        )
+
+        logger.info("Redis websocket subscriber started")
+
+    async def stop(self):
+        self.running = False
+
+        if self.task:
+            self.task.cancel()
+
+        logger.info("Redis websocket subscriber stopped")
+
+    async def _listen(self):
+        while self.running:
+            try:
+                pubsub = await self.redis.subscribe(CHANNEL_GLOBAL)
+
+                if not pubsub:
+                    await asyncio.sleep(5)
+                    continue
+
+                async for message in pubsub.listen():
+
+                    if message["type"] != "message":
+                        continue
+
+                    payload = json.loads(message["data"])
+
+                    await manager.broadcast_all(payload)
+
+            except Exception as exc:
+                logger.error(f"Redis subscriber crashed: {exc}")
+                await asyncio.sleep(5)
+
+
+async def publish_global(payload: dict):
+    redis = RedisManager()
+
+    await redis.connect()
+
+    await redis.publish(
+        CHANNEL_GLOBAL,
+        payload,
+    )
+
+
+broadcaster_task = RedisSubscriberTask()
+
+============================================================
+FILE: app\websockets\events.py
+============================================================
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, Field
+
+
+class EventType(str, Enum):
+    WORKFLOW_STARTED = "workflow_started"
+    WORKFLOW_PROGRESS = "workflow_progress"
+    WORKFLOW_COMPLETED = "workflow_completed"
+    WORKFLOW_FAILED = "workflow_failed"
+    AGENT_STARTED = "agent_started"
+    AGENT_COMPLETED = "agent_completed"
+    AGENT_FAILED = "agent_failed"
+    DRAFT_UPDATED = "draft_updated"
+    ARTIFACT_CREATED = "artifact_created"
+    COPILOT_MESSAGE = "copilot_message"
+    PING = "ping"
+    PONG = "pong"
+    CONNECTION_ACK = "connection_ack"
+    ERROR = "error"
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+class BaseEvent(BaseModel):
+    event_id: str = Field(default_factory=lambda: str(uuid4()))
+    event_type: EventType
+    project_id: str
+    timestamp: str = Field(default_factory=_now_iso)
+
+    def to_ws_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+
+class WorkflowStartedEvent(BaseEvent):
+    event_type: Literal[EventType.WORKFLOW_STARTED] = EventType.WORKFLOW_STARTED
+    topic: str
+    total_agents: int
+    initiated_by: str
+
+
+class WorkflowProgressEvent(BaseEvent):
+    event_type: Literal[EventType.WORKFLOW_PROGRESS] = EventType.WORKFLOW_PROGRESS
+    current_agent: str
+    completed_agents: int
+    total_agents: int
+    percent_complete: float
+    message: str
+
+
+class WorkflowCompletedEvent(BaseEvent):
+    event_type: Literal[EventType.WORKFLOW_COMPLETED] = EventType.WORKFLOW_COMPLETED
+    duration_seconds: float
+    papers_retrieved: int
+    sections_generated: int
+    tokens_used: int
+
+
+class WorkflowFailedEvent(BaseEvent):
+    event_type: Literal[EventType.WORKFLOW_FAILED] = EventType.WORKFLOW_FAILED
+    failed_agent: str
+    error_message: str
+    retry_possible: bool = True
+
+
+class AgentStartedEvent(BaseEvent):
+    event_type: Literal[EventType.AGENT_STARTED] = EventType.AGENT_STARTED
+    agent_name: str
+    agent_description: str
+    agent_index: int
+    total_agents: int
+
+
+class AgentCompletedEvent(BaseEvent):
+    event_type: Literal[EventType.AGENT_COMPLETED] = EventType.AGENT_COMPLETED
+    agent_name: str
+    duration_seconds: float
+    tokens_used: int
+    output_summary: str
+    artifacts_produced: list[str] = Field(default_factory=list)
+
+
+class AgentFailedEvent(BaseEvent):
+    event_type: Literal[EventType.AGENT_FAILED] = EventType.AGENT_FAILED
+    agent_name: str
+    error_message: str
+    error_type: str
+    duration_seconds: float
+    retrying: bool = False
+
+
+class DraftUpdatedEvent(BaseEvent):
+    event_type: Literal[EventType.DRAFT_UPDATED] = EventType.DRAFT_UPDATED
+    section_id: str
+    section_title: str
+    content_chunk: str
+    is_final: bool
+    word_count: int
+
+
+class ArtifactCreatedEvent(BaseEvent):
+    event_type: Literal[EventType.ARTIFACT_CREATED] = EventType.ARTIFACT_CREATED
+    artifact_type: str
+    artifact_id: str
+    artifact_title: str
+    agent_source: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CopilotMessageEvent(BaseEvent):
+    event_type: Literal[EventType.COPILOT_MESSAGE] = EventType.COPILOT_MESSAGE
+    message_id: str
+    role: Literal["assistant"]
+    content: str
+    is_streaming: bool
+    is_final: bool
+    context_sources: list[str] = Field(default_factory=list)
+
+
+class PingEvent(BaseEvent):
+    event_type: Literal[EventType.PING] = EventType.PING
+
+
+class PongEvent(BaseEvent):
+    event_type: Literal[EventType.PONG] = EventType.PONG
+
+
+class ConnectionAckEvent(BaseEvent):
+    event_type: Literal[EventType.CONNECTION_ACK] = EventType.CONNECTION_ACK
+    connection_id: str
+    user_id: str
+    subscribed_to: str
+
+
+class ErrorEvent(BaseEvent):
+    event_type: Literal[EventType.ERROR] = EventType.ERROR
+    code: str
+    message: str
+    recoverable: bool = True
+
+
+AnyEvent = (
+    WorkflowStartedEvent
+    | WorkflowProgressEvent
+    | WorkflowCompletedEvent
+    | WorkflowFailedEvent
+    | AgentStartedEvent
+    | AgentCompletedEvent
+    | AgentFailedEvent
+    | DraftUpdatedEvent
+    | ArtifactCreatedEvent
+    | CopilotMessageEvent
+    | PingEvent
+    | PongEvent
+    | ConnectionAckEvent
+    | ErrorEvent
+)
+
+============================================================
+FILE: app\integrations\arxiv_client.py
+============================================================
+"""Async arXiv API client for searching and retrieving academic papers.
+
+Uses the public arXiv Atom XML feed at ``http://export.arxiv.org/api/query``
+with strict adherence to the arXiv API rate-limit policy (≤1 request per
+3 seconds).  Search results are optionally cached in Redis for 1 hour.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from app.config import get_settings
+from app.core.exceptions import ExternalAPIError
+from app.integrations.redis_client import RedisManager
+from app.utils.logging import get_logger
+from app.utils.retry import with_retry
+
+logger = get_logger(__name__)
+
+_ARXIV_BASE_URL = "http://export.arxiv.org/api/query"
+_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+_OPENSEARCH_NS = "{http://a9.com/-/spec/opensearch/1.1/}"
+_ARXIV_NS = "{http://arxiv.org/schemas/atom}"
+
+# Minimum interval between arXiv API requests (seconds).
+_RATE_LIMIT_INTERVAL: float = 3.0
+
+# Cache TTL for search results (seconds).
+_CACHE_TTL: int = 3600  # 1 hour
+
+
+@dataclass(frozen=True, slots=True)
+class ArxivPaper:
+    """Structured representation of an arXiv paper.
+
+    Attributes:
+        id: The arXiv identifier, e.g. ``2301.01234``.
+        title: Paper title (whitespace-normalised).
+        abstract: Full abstract text.
+        authors: Ordered list of author names.
+        published: Original publication timestamp.
+        updated: Most recent update timestamp.
+        categories: arXiv subject categories (primary first).
+        doi: Digital Object Identifier, if available.
+        pdf_url: Direct link to the PDF.
+        comment: Author comment (e.g. page count, conference).
+    """
+
+    id: str
+    title: str
+    abstract: str
+    authors: list[str]
+    published: datetime
+    updated: datetime
+    categories: list[str]
+    doi: str | None = None
+    pdf_url: str = ""
+    comment: str | None = None
+
+
+class ArxivClient:
+    """Async client for the arXiv search API.
+
+    Instantiate once and reuse — the underlying ``httpx.AsyncClient``
+    and rate-limiter are shared across calls.
+
+    Args:
+        use_cache: Whether to cache search results in Redis (default
+            ``True``).  Caching is silently skipped when Redis is
+            unavailable.
+    """
+
+    def __init__(self, *, use_cache: bool = True) -> None:
+        self._use_cache = use_cache
+        self._http: httpx.AsyncClient | None = None
+        self._last_request_time: float = 0.0
+        self._rate_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Lifecycle helpers
+    # ------------------------------------------------------------------
+
+    async def _get_http(self) -> httpx.AsyncClient:
+        """Return a lazily-initialised ``httpx.AsyncClient``."""
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=True,
+                headers={"User-Agent": "ResearchOS/1.0 (async arXiv client)"},
+            )
+        return self._http
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+            self._http = None
+
+    # ------------------------------------------------------------------
+    # Rate limiting
+    # ------------------------------------------------------------------
+
+    async def _wait_for_rate_limit(self) -> None:
+        """Enforce ≤1 request per ``_RATE_LIMIT_INTERVAL`` seconds."""
+        async with self._rate_lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last_request_time
+            if elapsed < _RATE_LIMIT_INTERVAL:
+                wait = _RATE_LIMIT_INTERVAL - elapsed
+                logger.debug("arxiv.rate_limit_wait", wait_seconds=round(wait, 2))
+                await asyncio.sleep(wait)
+            self._last_request_time = asyncio.get_event_loop().time()
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cache_key(prefix: str, identifier: str) -> str:
+        """Build a deterministic cache key."""
+        digest = hashlib.sha256(identifier.encode()).hexdigest()[:16]
+        return f"arxiv:{prefix}:{digest}"
+
+    async def _cache_get(self, key: str) -> Any | None:
+        if not self._use_cache:
+            return None
+        redis = RedisManager()
+        return await redis.get(key)
+
+    async def _cache_set(self, key: str, value: Any) -> None:
+        if not self._use_cache:
+            return
+        redis = RedisManager()
+        await redis.set(key, value, ttl=_CACHE_TTL)
+
+    # ------------------------------------------------------------------
+    # XML parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_entry(entry: ET.Element) -> ArxivPaper:
+        """Parse a single ``<entry>`` element into an ``ArxivPaper``."""
+
+        def _text(tag: str, ns: str = _ATOM_NS) -> str:
+            el = entry.find(f"{ns}{tag}")
+            return (el.text or "").strip() if el is not None else ""
+
+        def _normalise(text: str) -> str:
+            return re.sub(r"\s+", " ", text).strip()
+
+        # ID — strip version suffix for canonical identifier.
+        raw_id = _text("id")
+        arxiv_id = raw_id.rsplit("/abs/", maxsplit=1)[-1]
+        arxiv_id = re.sub(r"v\d+$", "", arxiv_id)
+
+        # Authors
+        authors = [
+            (a.find(f"{_ATOM_NS}name").text or "").strip()
+            for a in entry.findall(f"{_ATOM_NS}author")
+            if a.find(f"{_ATOM_NS}name") is not None
+        ]
+
+        # Dates
+        def _parse_dt(tag: str) -> datetime:
+            raw = _text(tag)
+            if not raw:
+                return datetime.min
+            # arXiv uses ISO 8601 with 'T' and 'Z'.
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+        published = _parse_dt("published")
+        updated = _parse_dt("updated")
+
+        # Categories
+        categories = [
+            c.attrib.get("term", "")
+            for c in entry.findall(f"{_ATOM_NS}category")
+            if c.attrib.get("term")
+        ]
+
+        # PDF link
+        pdf_url = ""
+        for link in entry.findall(f"{_ATOM_NS}link"):
+            if link.attrib.get("title") == "pdf":
+                pdf_url = link.attrib.get("href", "")
+                break
+
+        # DOI (arXiv namespace)
+        doi_el = entry.find(f"{_ARXIV_NS}doi")
+        doi = (doi_el.text or "").strip() if doi_el is not None else None
+        doi = doi or None
+
+        # Comment
+        comment_el = entry.find(f"{_ARXIV_NS}comment")
+        comment = (comment_el.text or "").strip() if comment_el is not None else None
+        comment = comment or None
+
+        return ArxivPaper(
+            id=arxiv_id,
+            title=_normalise(_text("title")),
+            abstract=_normalise(_text("summary")),
+            authors=authors,
+            published=published,
+            updated=updated,
+            categories=categories,
+            doi=doi,
+            pdf_url=pdf_url,
+            comment=comment,
+        )
+
+    def _parse_feed(self, xml_bytes: bytes) -> list[ArxivPaper]:
+        """Parse the full Atom feed and return a list of papers."""
+        root = ET.fromstring(xml_bytes)
+        entries = root.findall(f"{_ATOM_NS}entry")
+        papers: list[ArxivPaper] = []
+        for entry in entries:
+            try:
+                papers.append(self._parse_entry(entry))
+            except Exception as exc:  # noqa: BLE001 — never crash on one bad entry
+                logger.warning("arxiv.parse_entry_failed", error=str(exc))
+        return papers
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @with_retry(max_retries=3, retryable_exceptions=(httpx.HTTPStatusError, httpx.RequestError))
+    async def search(
+        self,
+        query: str,
+        max_results: int = 20,
+        *,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+        start: int = 0,
+    ) -> list[ArxivPaper]:
+        """Search arXiv for papers matching *query*.
+
+        Args:
+            query: arXiv search query (supports field prefixes like
+                ``au:``, ``ti:``, ``cat:``).
+            max_results: Maximum number of results (capped at 100 by
+                arXiv API).
+            sort_by: ``"relevance"`` or ``"lastUpdatedDate"`` or
+                ``"submittedDate"``.
+            sort_order: ``"ascending"`` or ``"descending"``.
+            start: Offset for pagination.
+
+        Returns:
+            List of :class:`ArxivPaper` objects.
+
+        Raises:
+            ExternalAPIError: On HTTP or parsing failures.
+        """
+        max_results = min(max_results, 100)
+
+        # Check cache first
+        cache_id = f"{query}:{max_results}:{sort_by}:{sort_order}:{start}"
+        cache_key = self._cache_key("search", cache_id)
+        cached = await self._cache_get(cache_key)
+        if cached is not None:
+            logger.debug("arxiv.cache_hit", query=query)
+            return [ArxivPaper(**p) for p in cached]
+
+        params = {
+            "search_query": query,
+            "start": start,
+            "max_results": max_results,
+            "sortBy": sort_by,
+            "sortOrder": sort_order,
+        }
+
+        await self._wait_for_rate_limit()
+        client = await self._get_http()
+
+        try:
+            response = await client.get(_ARXIV_BASE_URL, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "arxiv.search_http_error",
+                status=exc.response.status_code,
+                query=query,
+            )
+            raise ExternalAPIError(
+                f"arXiv API returned HTTP {exc.response.status_code}",
+                service="arxiv",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error("arxiv.search_request_error", query=query, error=str(exc))
+            raise ExternalAPIError(
+                f"arXiv API request failed: {exc}",
+                service="arxiv",
+            ) from exc
+
+        try:
+            papers = self._parse_feed(response.content)
+        except ET.ParseError as exc:
+            logger.error("arxiv.xml_parse_error", query=query, error=str(exc))
+            raise ExternalAPIError(
+                "Failed to parse arXiv API response XML",
+                service="arxiv",
+            ) from exc
+
+        logger.info("arxiv.search_complete", query=query, results=len(papers))
+
+        # Populate cache
+        await self._cache_set(cache_key, [asdict(p) for p in papers])
+
+        return papers
+
+    async def get_paper(self, arxiv_id: str) -> ArxivPaper:
+        """Retrieve metadata for a single paper by its arXiv ID.
+
+        Args:
+            arxiv_id: Bare arXiv identifier, e.g. ``"2301.01234"``.
+
+        Returns:
+            An :class:`ArxivPaper` instance.
+
+        Raises:
+            ExternalAPIError: If the paper is not found or the API
+                returns an error.
+        """
+        cache_key = self._cache_key("paper", arxiv_id)
+        cached = await self._cache_get(cache_key)
+        if cached is not None:
+            logger.debug("arxiv.paper_cache_hit", arxiv_id=arxiv_id)
+            return ArxivPaper(**cached)
+
+        await self._wait_for_rate_limit()
+        client = await self._get_http()
+
+        params = {"id_list": arxiv_id, "max_results": 1}
+        try:
+            response = await client.get(_ARXIV_BASE_URL, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "arxiv.get_paper_http_error",
+                status=exc.response.status_code,
+                arxiv_id=arxiv_id,
+            )
+            raise ExternalAPIError(
+                f"arXiv API returned HTTP {exc.response.status_code}",
+                service="arxiv",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error(
+                "arxiv.get_paper_request_error",
+                arxiv_id=arxiv_id,
+                error=str(exc),
+            )
+            raise ExternalAPIError(
+                f"arXiv API request failed: {exc}",
+                service="arxiv",
+            ) from exc
+
+        papers = self._parse_feed(response.content)
+        if not papers:
+            raise ExternalAPIError(
+                f"Paper {arxiv_id} not found on arXiv",
+                service="arxiv",
+            )
+
+        paper = papers[0]
+        await self._cache_set(cache_key, asdict(paper))
+        logger.info("arxiv.get_paper_complete", arxiv_id=arxiv_id, title=paper.title)
+        return paper
+
+    async def download_pdf(self, arxiv_id: str, save_path: str | Path) -> Path:
+        """Download the PDF for *arxiv_id* to *save_path*.
+
+        Args:
+            arxiv_id: Bare arXiv identifier, e.g. ``"2301.01234"``.
+            save_path: Directory or full file path where the PDF should
+                be saved.  If a directory, the file is named
+                ``<arxiv_id>.pdf``.
+
+        Returns:
+            Resolved :class:`Path` to the downloaded file.
+
+        Raises:
+            ExternalAPIError: On download failure.
+        """
+        save_path = Path(save_path)
+        if save_path.is_dir():
+            safe_name = arxiv_id.replace("/", "_")
+            save_path = save_path / f"{safe_name}.pdf"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+        await self._wait_for_rate_limit()
+        client = await self._get_http()
+
+        try:
+            response = await client.get(pdf_url)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "arxiv.download_http_error",
+                status=exc.response.status_code,
+                arxiv_id=arxiv_id,
+            )
+            raise ExternalAPIError(
+                f"Failed to download PDF for {arxiv_id}: HTTP {exc.response.status_code}",
+                service="arxiv",
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.error(
+                "arxiv.download_request_error",
+                arxiv_id=arxiv_id,
+                error=str(exc),
+            )
+            raise ExternalAPIError(
+                f"PDF download request failed: {exc}",
+                service="arxiv",
+            ) from exc
+
+        save_path.write_bytes(response.content)
+        logger.info(
+            "arxiv.pdf_downloaded",
+            arxiv_id=arxiv_id,
+            path=str(save_path),
+            size_bytes=len(response.content),
+        )
+        return save_path.resolve()
+
+============================================================
+FILE: app\integrations\semantic_scholar_client.py
+============================================================
+"""Async Semantic Scholar API client.
+
+Provides access to the Semantic Scholar Academic Graph v1 endpoints for
+paper search, metadata retrieval, citations, and references.
+
+Rate limits:
+- **Without** API key: 100 requests per 5 minutes (~0.33 req/s).
+- **With** API key: 1 request per second.
+
+The client automatically detects whether an API key is configured and
+adapts its rate limiting accordingly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+import httpx
+
+from app.config import get_settings
+from app.core.exceptions import ExternalAPIError
+from app.integrations.redis_client import RedisManager
+from app.utils.logging import get_logger
+from app.utils.retry import with_retry
+
+logger = get_logger(__name__)
+
+_S2_BASE_URL = "https://api.semanticscholar.org/graph/v1"
+_CACHE_TTL = 3600  # 1 hour
+
+# Default fields requested if the caller does not specify any.
+_DEFAULT_PAPER_FIELDS = (
+    "paperId,title,abstract,authors,year,venue,citationCount,"
+    "referenceCount,doi,url,fieldsOfStudy,tldr,externalIds"
+)
+
+
+@dataclass(slots=True)
+class S2Paper:
+    """Structured representation of a Semantic Scholar paper.
+
+    Attributes:
+        paperId: Unique Semantic Scholar paper identifier.
+        title: Paper title.
+        abstract: Abstract text (may be ``None`` for some papers).
+        authors: List of author dicts with ``authorId`` and ``name``.
+        year: Publication year.
+        venue: Publication venue.
+        citationCount: Number of citations.
+        referenceCount: Number of references.
+        doi: Digital Object Identifier.
+        url: Semantic Scholar URL.
+        fieldsOfStudy: List of field-of-study strings.
+        tldr: Auto-generated TL;DR dict (``model``, ``text``).
+        externalIds: Mapping of external IDs (e.g. DOI, ArXiv).
+    """
+
+    paperId: str = ""
+    title: str = ""
+    abstract: str | None = None
+    authors: list[dict[str, Any]] = field(default_factory=list)
+    year: int | None = None
+    venue: str = ""
+    citationCount: int = 0
+    referenceCount: int = 0
+    doi: str | None = None
+    url: str = ""
+    fieldsOfStudy: list[str] = field(default_factory=list)
+    tldr: dict[str, Any] | None = None
+    externalIds: dict[str, str] = field(default_factory=dict)
+
+
+class SemanticScholarClient:
+    """Async client for the Semantic Scholar Academic Graph API.
+
+    Usage::
+
+        async with SemanticScholarClient() as s2:
+            papers = await s2.search("transformer attention")
+            paper = await s2.get_paper("649def34f8be52c8b66281af98ae884c09aef38b")
+    """
+
+    def __init__(self) -> None:
+        self._http: httpx.AsyncClient | None = None
+        self._api_key: str | None = None
+        self._last_request_time: float = 0.0
+        self._rate_lock = asyncio.Lock()
+        self._rate_interval: float = 1.0  # default (with key)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            settings = get_settings()
+            self._api_key = settings.semantic_scholar_api_key or None
+            if self._api_key in (None, "", "your-semantic-scholar-api-key"):
+                self._api_key = None
+
+            headers: dict[str, str] = {
+                "User-Agent": "ResearchOS/1.0 (Semantic Scholar client)",
+            }
+            if self._api_key:
+                headers["x-api-key"] = self._api_key
+                self._rate_interval = 1.0
+            else:
+                # 100 requests per 5 min = 3 seconds between requests
+                self._rate_interval = 3.0
+
+            self._http = httpx.AsyncClient(
+                base_url=_S2_BASE_URL,
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=True,
+                headers=headers,
+            )
+        return self._http
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+            self._http = None
+
+    async def __aenter__(self) -> SemanticScholarClient:
+        await self._get_http()
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.close()
+
+    # ------------------------------------------------------------------
+    # Rate limiter
+    # ------------------------------------------------------------------
+
+    async def _wait_for_rate_limit(self) -> None:
+        async with self._rate_lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last_request_time
+            if elapsed < self._rate_interval:
+                wait = self._rate_interval - elapsed
+                logger.debug("s2.rate_limit_wait", wait_seconds=round(wait, 2))
+                await asyncio.sleep(wait)
+            self._last_request_time = asyncio.get_event_loop().time()
+
+    # ------------------------------------------------------------------
+    # Internal request helper
+    # ------------------------------------------------------------------
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        max_retries: int = 3,
+    ) -> dict[str, Any]:
+        """Issue a rate-limited HTTP request with retry on 429."""
+        client = await self._get_http()
+
+        for attempt in range(1, max_retries + 1):
+            await self._wait_for_rate_limit()
+            try:
+                response = await client.request(method, path, params=params)
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", "5"))
+                    logger.warning(
+                        "s2.rate_limited",
+                        attempt=attempt,
+                        retry_after=retry_after,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    raise ExternalAPIError(
+                        f"Resource not found at {path}",
+                        service="semantic_scholar",
+                    ) from exc
+                if attempt == max_retries:
+                    raise ExternalAPIError(
+                        f"S2 API error HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+                        service="semantic_scholar",
+                    ) from exc
+                await asyncio.sleep(2**attempt)
+            except httpx.RequestError as exc:
+                if attempt == max_retries:
+                    raise ExternalAPIError(
+                        f"S2 API request failed: {exc}",
+                        service="semantic_scholar",
+                    ) from exc
+                await asyncio.sleep(2**attempt)
+
+        raise ExternalAPIError(
+            "S2 API max retries exhausted",
+            service="semantic_scholar",
+        )
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _cache_get(key: str) -> Any | None:
+        redis = RedisManager()
+        return await redis.get(key)
+
+    @staticmethod
+    async def _cache_set(key: str, value: Any) -> None:
+        redis = RedisManager()
+        await redis.set(key, value, ttl=_CACHE_TTL)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @with_retry(max_retries=3, retryable_exceptions=(httpx.HTTPStatusError, httpx.RequestError))
+    async def search(
+        self,
+        query: str,
+        limit: int = 20,
+        fields: str | None = None,
+    ) -> list[S2Paper]:
+        """Search for papers matching *query*.
+
+        Args:
+            query: Free-text search query.
+            limit: Maximum number of results (1–100).
+            fields: Comma-separated field names.  Uses
+                ``_DEFAULT_PAPER_FIELDS`` when ``None``.
+
+        Returns:
+            List of :class:`S2Paper` instances.
+
+        Raises:
+            ExternalAPIError: On API failure.
+        """
+        limit = max(1, min(limit, 100))
+        fields = fields or _DEFAULT_PAPER_FIELDS
+
+        cache_key = f"s2:search:{query}:{limit}:{fields}"
+        cached = await self._cache_get(cache_key)
+        if cached is not None:
+            logger.debug("s2.cache_hit", query=query)
+            return [S2Paper(**p) for p in cached]
+
+        data = await self._request(
+            "GET",
+            "/paper/search",
+            params={"query": query, "limit": limit, "fields": fields},
+        )
+
+        papers = [
+            self._dict_to_paper(item) for item in data.get("data", [])
+        ]
+        logger.info("s2.search_complete", query=query, results=len(papers))
+        await self._cache_set(cache_key, [asdict(p) for p in papers])
+        return papers
+
+    async def get_paper(
+        self,
+        paper_id: str,
+        fields: str | None = None,
+    ) -> S2Paper:
+        """Retrieve metadata for a single paper.
+
+        Args:
+            paper_id: Semantic Scholar paper ID, DOI, arXiv ID
+                (prefixed ``ARXIV:``), or other supported identifier.
+            fields: Comma-separated field names.
+
+        Returns:
+            A populated :class:`S2Paper`.
+
+        Raises:
+            ExternalAPIError: If the paper is not found or the API
+                returns an error.
+        """
+        fields = fields or _DEFAULT_PAPER_FIELDS
+
+        cache_key = f"s2:paper:{paper_id}:{fields}"
+        cached = await self._cache_get(cache_key)
+        if cached is not None:
+            return S2Paper(**cached)
+
+        data = await self._request(
+            "GET",
+            f"/paper/{paper_id}",
+            params={"fields": fields},
+        )
+
+        paper = self._dict_to_paper(data)
+        logger.info("s2.get_paper_complete", paper_id=paper_id, title=paper.title)
+        await self._cache_set(cache_key, asdict(paper))
+        return paper
+
+    async def get_citations(
+        self,
+        paper_id: str,
+        limit: int = 100,
+        fields: str | None = None,
+    ) -> list[S2Paper]:
+        """Return papers that cite the given paper.
+
+        Args:
+            paper_id: Semantic Scholar paper identifier.
+            limit: Maximum number of citing papers.
+            fields: Comma-separated field names for the citing papers.
+
+        Returns:
+            List of citing :class:`S2Paper` objects.
+        """
+        limit = max(1, min(limit, 1000))
+        citing_fields = fields or "paperId,title,abstract,authors,year,venue,citationCount,doi,url"
+
+        data = await self._request(
+            "GET",
+            f"/paper/{paper_id}/citations",
+            params={"limit": limit, "fields": citing_fields},
+        )
+
+        papers: list[S2Paper] = []
+        for item in data.get("data", []):
+            citing = item.get("citingPaper")
+            if citing:
+                papers.append(self._dict_to_paper(citing))
+
+        logger.info(
+            "s2.citations_complete",
+            paper_id=paper_id,
+            results=len(papers),
+        )
+        return papers
+
+    async def get_references(
+        self,
+        paper_id: str,
+        limit: int = 100,
+        fields: str | None = None,
+    ) -> list[S2Paper]:
+        """Return papers referenced by the given paper.
+
+        Args:
+            paper_id: Semantic Scholar paper identifier.
+            limit: Maximum number of referenced papers.
+            fields: Comma-separated field names.
+
+        Returns:
+            List of referenced :class:`S2Paper` objects.
+        """
+        limit = max(1, min(limit, 1000))
+        ref_fields = fields or "paperId,title,abstract,authors,year,venue,citationCount,doi,url"
+
+        data = await self._request(
+            "GET",
+            f"/paper/{paper_id}/references",
+            params={"limit": limit, "fields": ref_fields},
+        )
+
+        papers: list[S2Paper] = []
+        for item in data.get("data", []):
+            cited = item.get("citedPaper")
+            if cited:
+                papers.append(self._dict_to_paper(cited))
+
+        logger.info(
+            "s2.references_complete",
+            paper_id=paper_id,
+            results=len(papers),
+        )
+        return papers
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dict_to_paper(raw: dict[str, Any]) -> S2Paper:
+        """Safely convert a raw API dict to an ``S2Paper``."""
+        return S2Paper(
+            paperId=raw.get("paperId", ""),
+            title=raw.get("title", ""),
+            abstract=raw.get("abstract"),
+            authors=raw.get("authors") or [],
+            year=raw.get("year"),
+            venue=raw.get("venue", ""),
+            citationCount=raw.get("citationCount") or 0,
+            referenceCount=raw.get("referenceCount") or 0,
+            doi=raw.get("doi") or raw.get("externalIds", {}).get("DOI"),
+            url=raw.get("url", ""),
+            fieldsOfStudy=raw.get("fieldsOfStudy") or [],
+            tldr=raw.get("tldr"),
+            externalIds=raw.get("externalIds") or {},
+        )
+
+============================================================
+FILE: app\integrations\crossref_client.py
+============================================================
+"""Async CrossRef API client for DOI metadata and verification.
+
+Uses the public CrossRef REST API at ``https://api.crossref.org/works``
+with "polite pool" headers (``mailto``) for improved rate-limit
+allowances.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime
+from typing import Any
+
+import httpx
+
+from app.config import get_settings
+from app.core.exceptions import ExternalAPIError
+from app.integrations.redis_client import RedisManager
+from app.utils.logging import get_logger
+from app.utils.retry import with_retry
+
+logger = get_logger(__name__)
+
+_CROSSREF_BASE_URL = "https://api.crossref.org/works"
+_CACHE_TTL = 3600  # 1 hour
+
+# CrossRef polite pool – set a contact email so requests are routed to
+# the higher-priority queue.
+_MAILTO = "researchos@example.com"
+
+
+@dataclass(slots=True)
+class CrossRefWork:
+    """Structured representation of a CrossRef work (publication).
+
+    Attributes:
+        doi: Digital Object Identifier.
+        title: Work title.
+        authors: List of author dicts with ``given`` and ``family`` keys.
+        published_date: Earliest available publication date.
+        venue: Container title (journal / conference name).
+        type: Work type (``journal-article``, ``proceedings-article``, etc.).
+        url: DOI URL.
+        references_count: Number of references made by this work.
+        is_referenced_by_count: Number of times this work is cited.
+        abstract: Abstract text (may be ``None`` — CrossRef coverage is
+            partial).
+    """
+
+    doi: str = ""
+    title: str = ""
+    authors: list[dict[str, str]] = field(default_factory=list)
+    published_date: str | None = None
+    venue: str = ""
+    type: str = ""
+    url: str = ""
+    references_count: int = 0
+    is_referenced_by_count: int = 0
+    abstract: str | None = None
+
+
+class CrossRefClient:
+    """Async client for the CrossRef REST API.
+
+    Usage::
+
+        async with CrossRefClient() as cr:
+            works = await cr.search("deep learning")
+            work = await cr.get_by_doi("10.1038/s41586-021-03819-2")
+            ok = await cr.verify_doi("10.1038/s41586-021-03819-2")
+    """
+
+    def __init__(self, *, mailto: str = _MAILTO) -> None:
+        self._mailto = mailto
+        self._http: httpx.AsyncClient | None = None
+        self._last_request_time: float = 0.0
+        self._rate_lock = asyncio.Lock()
+        # CrossRef polite pool: ~50 req/s — we stay conservative at 10 req/s.
+        self._rate_interval: float = 0.1
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=True,
+                headers={
+                    "User-Agent": f"ResearchOS/1.0 (mailto:{self._mailto})",
+                },
+            )
+        return self._http
+
+    async def close(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+            self._http = None
+
+    async def __aenter__(self) -> CrossRefClient:
+        await self._get_http()
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.close()
+
+    # ------------------------------------------------------------------
+    # Rate limiting
+    # ------------------------------------------------------------------
+
+    async def _wait_for_rate_limit(self) -> None:
+        async with self._rate_lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last_request_time
+            if elapsed < self._rate_interval:
+                await asyncio.sleep(self._rate_interval - elapsed)
+            self._last_request_time = asyncio.get_event_loop().time()
+
+    # ------------------------------------------------------------------
+    # Internal request helper
+    # ------------------------------------------------------------------
+
+    async def _request(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        *,
+        max_retries: int = 3,
+    ) -> dict[str, Any]:
+        client = await self._get_http()
+
+        for attempt in range(1, max_retries + 1):
+            await self._wait_for_rate_limit()
+            try:
+                response = await client.get(url, params=params)
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", "5"))
+                    logger.warning(
+                        "crossref.rate_limited",
+                        attempt=attempt,
+                        retry_after=retry_after,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    raise ExternalAPIError(
+                        f"CrossRef resource not found: {url}",
+                        service="crossref",
+                    ) from exc
+                if attempt == max_retries:
+                    raise ExternalAPIError(
+                        f"CrossRef API error HTTP {exc.response.status_code}",
+                        service="crossref",
+                    ) from exc
+                await asyncio.sleep(2**attempt)
+            except httpx.RequestError as exc:
+                if attempt == max_retries:
+                    raise ExternalAPIError(
+                        f"CrossRef API request failed: {exc}",
+                        service="crossref",
+                    ) from exc
+                await asyncio.sleep(2**attempt)
+
+        raise ExternalAPIError(
+            "CrossRef API max retries exhausted",
+            service="crossref",
+        )
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _cache_get(key: str) -> Any | None:
+        redis = RedisManager()
+        return await redis.get(key)
+
+    @staticmethod
+    async def _cache_set(key: str, value: Any) -> None:
+        redis = RedisManager()
+        await redis.set(key, value, ttl=_CACHE_TTL)
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_work(raw: dict[str, Any]) -> CrossRefWork:
+        """Convert a raw CrossRef API work item to ``CrossRefWork``."""
+        # Title — CrossRef stores titles as a list.
+        titles = raw.get("title") or []
+        title = titles[0] if titles else ""
+
+        # Authors
+        authors_raw = raw.get("author") or []
+        authors = [
+            {"given": a.get("given", ""), "family": a.get("family", "")}
+            for a in authors_raw
+        ]
+
+        # Published date — prefer 'published-print', fall back to
+        # 'published-online', then 'created'.
+        pub_date: str | None = None
+        for key in ("published-print", "published-online", "created"):
+            date_obj = raw.get(key)
+            if date_obj and "date-parts" in date_obj:
+                parts = date_obj["date-parts"][0]
+                if parts:
+                    try:
+                        year = int(parts[0])
+                        month = int(parts[1]) if len(parts) > 1 else 1
+                        day = int(parts[2]) if len(parts) > 2 else 1
+                        pub_date = date(year, month, day).isoformat()
+                        break
+                    except (ValueError, TypeError, IndexError):
+                        continue
+
+        # Container title (venue / journal)
+        container = raw.get("container-title") or []
+        venue = container[0] if container else ""
+
+        # Abstract — CrossRef sometimes includes JATS XML; strip tags.
+        abstract = raw.get("abstract")
+        if abstract:
+            import re
+            abstract = re.sub(r"<[^>]+>", "", abstract).strip()
+
+        return CrossRefWork(
+            doi=raw.get("DOI", ""),
+            title=title,
+            authors=authors,
+            published_date=pub_date,
+            venue=venue,
+            type=raw.get("type", ""),
+            url=raw.get("URL", ""),
+            references_count=raw.get("references-count", 0),
+            is_referenced_by_count=raw.get("is-referenced-by-count", 0),
+            abstract=abstract,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @with_retry(max_retries=3, retryable_exceptions=(httpx.HTTPStatusError, httpx.RequestError))
+    async def search(
+        self,
+        query: str,
+        rows: int = 20,
+        *,
+        sort: str = "relevance",
+        order: str = "desc",
+    ) -> list[CrossRefWork]:
+        """Search CrossRef for works matching *query*.
+
+        Args:
+            query: Free-text search query.
+            rows: Number of results (max 1000).
+            sort: Sort field (``relevance``, ``published``, etc.).
+            order: ``asc`` or ``desc``.
+
+        Returns:
+            List of :class:`CrossRefWork` instances.
+
+        Raises:
+            ExternalAPIError: On API failure.
+        """
+        rows = max(1, min(rows, 1000))
+
+        cache_key = f"crossref:search:{query}:{rows}:{sort}:{order}"
+        cached = await self._cache_get(cache_key)
+        if cached is not None:
+            logger.debug("crossref.cache_hit", query=query)
+            return [CrossRefWork(**w) for w in cached]
+
+        params: dict[str, Any] = {
+            "query": query,
+            "rows": rows,
+            "sort": sort,
+            "order": order,
+            "mailto": self._mailto,
+        }
+
+        data = await self._request(_CROSSREF_BASE_URL, params=params)
+
+        items = data.get("message", {}).get("items", [])
+        works = [self._parse_work(item) for item in items]
+
+        logger.info("crossref.search_complete", query=query, results=len(works))
+        await self._cache_set(cache_key, [asdict(w) for w in works])
+        return works
+
+    async def get_by_doi(self, doi: str) -> CrossRefWork:
+        """Retrieve metadata for a single work by DOI.
+
+        Args:
+            doi: A valid Digital Object Identifier, e.g.
+                ``"10.1038/s41586-021-03819-2"``.
+
+        Returns:
+            A populated :class:`CrossRefWork`.
+
+        Raises:
+            ExternalAPIError: If the DOI is not found.
+        """
+        doi = doi.strip().strip("/")
+
+        cache_key = f"crossref:doi:{doi}"
+        cached = await self._cache_get(cache_key)
+        if cached is not None:
+            return CrossRefWork(**cached)
+
+        url = f"{_CROSSREF_BASE_URL}/{doi}"
+        params = {"mailto": self._mailto}
+
+        data = await self._request(url, params=params)
+        work = self._parse_work(data.get("message", {}))
+        logger.info("crossref.get_by_doi_complete", doi=doi, title=work.title)
+        await self._cache_set(cache_key, asdict(work))
+        return work
+
+    async def verify_doi(self, doi: str) -> bool:
+        """Check whether a DOI exists in CrossRef.
+
+        Args:
+            doi: The DOI to verify.
+
+        Returns:
+            ``True`` if the DOI resolves to a valid work, ``False``
+            otherwise.
+        """
+        doi = doi.strip().strip("/")
+        url = f"{_CROSSREF_BASE_URL}/{doi}"
+        client = await self._get_http()
+
+        await self._wait_for_rate_limit()
+        try:
+            response = await client.head(
+                url, params={"mailto": self._mailto}
+            )
+            exists = response.status_code == 200
+            logger.info("crossref.verify_doi", doi=doi, exists=exists)
+            return exists
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.warning("crossref.verify_doi_failed", doi=doi, error=str(exc))
+            return False
+
+============================================================
+FILE: app\integrations\pinecone_client.py
+============================================================
+"""Pinecone vector-database client wrapper.
+
+Provides ``PineconeManager`` — a thin async wrapper around the
+official Pinecone Python SDK (``pinecone-client >= 3.0``) with:
+
+- Index creation / connection.
+- Batched upsert of embedding vectors with metadata.
+- Filtered vector queries.
+- Deletion by metadata filter.
+- Index statistics.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+from pinecone import Pinecone, ServerlessSpec
+
+from app.config import get_settings
+from app.core.exceptions import VectorStoreError
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+_UPSERT_BATCH_SIZE = 100
+
+
+@dataclass(frozen=True, slots=True)
+class QueryResult:
+    """Single result from a Pinecone vector query.
+
+    Attributes:
+        id: Vector identifier.
+        score: Cosine similarity score (0–1).
+        metadata: Arbitrary metadata dict stored alongside the vector.
+    """
+
+    id: str
+    score: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class PineconeManager:
+    """Manages a single Pinecone index for ResearchOS embeddings.
+
+    Instantiate once at application startup and call :meth:`init_index`
+    before performing any operations.
+
+    Usage::
+
+        pm = PineconeManager()
+        await pm.init_index()
+        await pm.upsert_vectors([
+            {"id": "v1", "values": [...], "metadata": {...}},
+        ])
+        results = await pm.query(query_vec, top_k=5)
+    """
+
+    def __init__(self) -> None:
+        self._pc: Pinecone | None = None
+        self._index: Any | None = None
+        self._index_name: str = ""
+        self._dimension: int = 1024
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    async def init_index(self) -> None:
+        """Create or connect to the configured Pinecone index.
+
+        Reads ``PINECONE_API_KEY``, ``PINECONE_INDEX_NAME``,
+        ``PINECONE_ENVIRONMENT``, and ``EMBEDDING_DIMENSION`` from
+        settings.
+
+        Raises:
+            VectorStoreError: On authentication or connection failure.
+        """
+        settings = get_settings()
+        api_key: str = settings.pinecone_api_key
+        self._index_name = settings.pinecone_index_name
+        environment: str = settings.pinecone_environment
+        self._dimension = settings.embedding_dimension
+
+        try:
+            self._pc = await asyncio.to_thread(Pinecone, api_key=api_key)
+
+            # List existing indexes to decide whether to create.
+            existing_indexes = await asyncio.to_thread(self._pc.list_indexes)
+            index_names = [idx.name for idx in existing_indexes]
+
+            if self._index_name not in index_names:
+                logger.info(
+                    "pinecone.creating_index",
+                    name=self._index_name,
+                    dimension=self._dimension,
+                )
+                await asyncio.to_thread(
+                    self._pc.create_index,
+                    name=self._index_name,
+                    dimension=self._dimension,
+                    metric="cosine",
+                    spec=ServerlessSpec(
+                        cloud="aws",
+                        region=environment,
+                    ),
+                )
+                logger.info("pinecone.index_created", name=self._index_name)
+
+            self._index = await asyncio.to_thread(
+                self._pc.Index, self._index_name
+            )
+            logger.info("pinecone.connected", index=self._index_name)
+
+        except Exception as exc:
+            logger.error("pinecone.init_failed", error=str(exc))
+            raise VectorStoreError(
+                f"Failed to initialise Pinecone index: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Guard
+    # ------------------------------------------------------------------
+
+    def _ensure_index(self) -> Any:
+        """Return the index or raise if not initialised."""
+        if self._index is None:
+            raise VectorStoreError(
+                "Pinecone index not initialised — call init_index() first"
+            )
+        return self._index
+
+    # ------------------------------------------------------------------
+    # Upsert
+    # ------------------------------------------------------------------
+
+    async def upsert_vectors(self, vectors: list[dict[str, Any]]) -> int:
+        """Batch-upsert vectors into the index.
+
+        Each item in *vectors* must have:
+        - ``id`` (str): unique vector identifier.
+        - ``values`` (list[float]): the embedding vector.
+        - ``metadata`` (dict): arbitrary metadata.
+
+        Vectors are upserted in batches of ``_UPSERT_BATCH_SIZE`` to
+        stay within Pinecone payload limits.
+
+        Args:
+            vectors: List of vector dicts.
+
+        Returns:
+            Total number of vectors upserted.
+
+        Raises:
+            VectorStoreError: On upsert failure.
+        """
+        index = self._ensure_index()
+        total_upserted = 0
+        num_batches = math.ceil(len(vectors) / _UPSERT_BATCH_SIZE)
+
+        for batch_idx in range(num_batches):
+            start = batch_idx * _UPSERT_BATCH_SIZE
+            end = start + _UPSERT_BATCH_SIZE
+            batch = vectors[start:end]
+
+            # Convert to list of tuples (id, values, metadata) accepted
+            # by the SDK.
+            records = [
+                (v["id"], v["values"], v.get("metadata", {}))
+                for v in batch
+            ]
+
+            try:
+                await asyncio.to_thread(index.upsert, vectors=records)
+                total_upserted += len(records)
+                logger.debug(
+                    "pinecone.upsert_batch",
+                    batch=batch_idx + 1,
+                    total_batches=num_batches,
+                    count=len(records),
+                )
+            except Exception as exc:
+                logger.error(
+                    "pinecone.upsert_failed",
+                    batch=batch_idx + 1,
+                    error=str(exc),
+                )
+                raise VectorStoreError(
+                    f"Pinecone upsert failed on batch {batch_idx + 1}: {exc}"
+                ) from exc
+
+        logger.info("pinecone.upsert_complete", total=total_upserted)
+        return total_upserted
+
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
+    async def query(
+        self,
+        vector: list[float],
+        top_k: int = 10,
+        filter: dict[str, Any] | None = None,
+        include_metadata: bool = True,
+    ) -> list[QueryResult]:
+        """Query the index for the nearest neighbours of *vector*.
+
+        Args:
+            vector: The query embedding.
+            top_k: Number of results to return.
+            filter: Optional Pinecone metadata filter dict.
+            include_metadata: Whether to include metadata in results.
+
+        Returns:
+            Ranked list of :class:`QueryResult` objects.
+
+        Raises:
+            VectorStoreError: On query failure.
+        """
+        index = self._ensure_index()
+
+        try:
+            response = await asyncio.to_thread(
+                index.query,
+                vector=vector,
+                top_k=top_k,
+                filter=filter or {},
+                include_metadata=include_metadata,
+            )
+        except Exception as exc:
+            logger.error("pinecone.query_failed", error=str(exc))
+            raise VectorStoreError(
+                f"Pinecone query failed: {exc}"
+            ) from exc
+
+        results: list[QueryResult] = []
+        for match in response.get("matches", []):
+            results.append(
+                QueryResult(
+                    id=match["id"],
+                    score=float(match.get("score", 0.0)),
+                    metadata=match.get("metadata", {}),
+                )
+            )
+
+        logger.debug("pinecone.query_complete", top_k=top_k, returned=len(results))
+        return results
+
+    # ------------------------------------------------------------------
+    # Delete
+    # ------------------------------------------------------------------
+
+    async def delete_by_filter(self, filter: dict[str, Any]) -> None:
+        """Delete vectors matching a metadata *filter*.
+
+        Args:
+            filter: Pinecone metadata filter dict (e.g.
+                ``{"paper_id": {"$eq": "abc123"}}``).
+
+        Raises:
+            VectorStoreError: On deletion failure.
+        """
+        index = self._ensure_index()
+
+        try:
+            await asyncio.to_thread(
+                index.delete, filter=filter
+            )
+            logger.info("pinecone.delete_by_filter", filter=filter)
+        except Exception as exc:
+            logger.error("pinecone.delete_failed", filter=filter, error=str(exc))
+            raise VectorStoreError(
+                f"Pinecone delete failed: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    async def get_index_stats(self) -> dict[str, Any]:
+        """Return index statistics (vector count, dimension, etc.).
+
+        Returns:
+            Dictionary with keys like ``total_vector_count``,
+            ``dimension``, and per-namespace breakdowns.
+
+        Raises:
+            VectorStoreError: On stats retrieval failure.
+        """
+        index = self._ensure_index()
+
+        try:
+            stats = await asyncio.to_thread(index.describe_index_stats)
+            result = {
+                "total_vector_count": stats.get("total_vector_count", 0),
+                "dimension": stats.get("dimension", self._dimension),
+                "namespaces": stats.get("namespaces", {}),
+                "index_fullness": stats.get("index_fullness", 0.0),
+            }
+            logger.info("pinecone.stats", **result)
+            return result
+        except Exception as exc:
+            logger.error("pinecone.stats_failed", error=str(exc))
+            raise VectorStoreError(
+                f"Failed to retrieve Pinecone index stats: {exc}"
+            ) from exc
+
+============================================================
+FILE: app\integrations\llm_client.py
+============================================================
+"""
+ResearchOS — Unified LLM Client
+
+Provides async interfaces to Mistral and Kimi (OpenAI-compatible)
+models with structured output support, streaming, and retry logic.
+
+Usage::
+
+    llm = LLMClient()
+    response = await llm.generate(
+        provider="mistral",
+        system_prompt="You are a research assistant.",
+        user_prompt="Summarize this paper.",
+    )
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any, AsyncGenerator, Optional
+
+import httpx
+
+from app.config import get_settings
+from app.core.constants import LLM_GENERATION_TIMEOUT
+from app.utils.logging import get_logger
+from app.utils.retry import with_retry
+
+logger = get_logger(__name__)
+
+
+class LLMClient:
+    """Unified async LLM client for Mistral and Kimi APIs."""
+
+    def __init__(self):
+        self._settings = get_settings()
+
+    # ── Core generation ─────────────────────────────────────────────
+
+    @with_retry(max_retries=3)
+    async def generate(
+        self,
+        provider: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+        response_format: Optional[str] = None,
+    ) -> str:
+        """
+        Generate a completion from the specified LLM provider.
+
+        Args:
+            provider: "mistral" or "kimi".
+            system_prompt: System-level instructions.
+            user_prompt: User message / context.
+            temperature: Sampling temperature (lower = more deterministic).
+            max_tokens: Maximum tokens in response.
+            response_format: Optional "json_object" for structured output.
+
+        Returns:
+            The generated text string.
+        """
+        if provider == "mistral":
+            return await self._call_mistral(
+                system_prompt, user_prompt, temperature, max_tokens, response_format
+            )
+        elif provider == "kimi":
+            return await self._call_kimi(
+                system_prompt, user_prompt, temperature, max_tokens, response_format
+            )
+        else:
+            raise ValueError(f"Unknown LLM provider: {provider}")
+
+    async def generate_json(
+        self,
+        provider: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+    ) -> dict:
+        """Generate and parse a JSON response from the LLM."""
+        raw = await self.generate(
+            provider=provider,
+            system_prompt=system_prompt + "\n\nRespond ONLY with valid JSON.",
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format="json_object",
+        )
+        # Strip markdown code fences if present
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            cleaned = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning("llm_json_parse_failed", raw_preview=raw[:200])
+            return {"raw_response": raw, "parse_error": True}
+
+    async def stream(
+        self,
+        provider: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+    ) -> AsyncGenerator[str, None]:
+        """Stream tokens from the LLM provider."""
+        if provider == "kimi":
+            async for token in self._stream_kimi(
+                system_prompt, user_prompt, temperature, max_tokens
+            ):
+                yield token
+        elif provider == "mistral":
+            async for token in self._stream_mistral(
+                system_prompt, user_prompt, temperature, max_tokens
+            ):
+                yield token
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+
+    # ── Mistral ─────────────────────────────────────────────────────
+
+    async def _call_mistral(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        response_format: Optional[str],
+    ) -> str:
+        api_key = self._settings.mistral_api_key
+        model = self._settings.mistral_model
+
+        if not api_key:
+            logger.warning("mistral_api_key_not_set")
+            return "[Mistral API key not configured — using placeholder response]"
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if response_format == "json_object":
+            body["response_format"] = {"type": "json_object"}
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers=headers,
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        logger.info(
+            "llm.mistral.complete",
+            model=model,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+        )
+        return content
+
+    async def _stream_mistral(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> AsyncGenerator[str, None]:
+        api_key = self._settings.mistral_api_key
+        if not api_key:
+            yield "[Mistral API key not configured]"
+            return
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self._settings.mistral_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        try:
+            async with asyncio.timeout(LLM_GENERATION_TIMEOUT):
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        "POST",
+                        "https://api.mistral.ai/v1/chat/completions",
+                        headers=headers,
+                        json=body,
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                payload = line[6:]
+                                if payload.strip() == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(payload)
+                                    delta = chunk["choices"][0].get("delta", {})
+                                    if "content" in delta and delta["content"]:
+                                        yield delta["content"]
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    continue
+        except asyncio.TimeoutError:
+            logger.warning("llm.mistral_stream_timeout")
+            raise
+
+    # ── Kimi (OpenAI-compatible) ────────────────────────────────────
+
+    async def _call_kimi(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+        response_format: Optional[str],
+    ) -> str:
+        api_key = self._settings.kimi_api_key
+        model = self._settings.kimi_model
+        base_url = self._settings.kimi_base_url
+
+        if not api_key:
+            logger.warning("kimi_api_key_not_set")
+            return "[Kimi API key not configured — using placeholder response]"
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if response_format == "json_object":
+            body["response_format"] = {"type": "json_object"}
+
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        logger.info(
+            "llm.kimi.complete",
+            model=model,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+        )
+        return content
+
+    async def _stream_kimi(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> AsyncGenerator[str, None]:
+        api_key = self._settings.kimi_api_key
+        if not api_key:
+            yield "[Kimi API key not configured]"
+            return
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self._settings.kimi_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        try:
+            async with asyncio.timeout(LLM_GENERATION_TIMEOUT):
+                async with httpx.AsyncClient(timeout=180.0) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{self._settings.kimi_base_url}/chat/completions",
+                        headers=headers,
+                        json=body,
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                payload = line[6:]
+                                if payload.strip() == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(payload)
+                                    delta = chunk["choices"][0].get("delta", {})
+                                    if "content" in delta and delta["content"]:
+                                        yield delta["content"]
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    continue
+        except asyncio.TimeoutError:
+            logger.warning("llm.kimi_stream_timeout")
+            raise
+
+============================================================
+FILE: app\rag\retriever.py
+============================================================
+"""
+ResearchOS — Semantic Retriever
+
+Retrieval with score-based filtering, deduplication, and context
+enrichment. Sits on top of VectorStore and EmbeddingGenerator to
+provide a high-level retrieval interface for agents.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from typing import Optional
+
+from app.rag.embeddings import EmbeddingGenerator
+from app.rag.vectorstore import VectorStore
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class RetrievalResult:
+    """A single retrieval result with full metadata."""
+    text: str
+    score: float
+    paper_id: str
+    doi: str = ""
+    title: str = ""
+    authors: str = ""
+    section: str = ""
+    chunk_index: int = 0
+    metadata: dict = field(default_factory=dict)
+
+
+class SemanticRetriever:
+    """
+    High-level semantic retrieval interface.
+
+    Combines embedding generation, Pinecone vector search,
+    score-based filtering, and deduplication into a single
+    retrieve() call.
+    """
+
+    # BGE query instruction prefix for asymmetric retrieval
+    QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+    # Minimum similarity score to include in results
+    MIN_SCORE_THRESHOLD = 0.5
+
+    def __init__(
+        self,
+        embedding_generator: Optional[EmbeddingGenerator] = None,
+        vector_store: Optional[VectorStore] = None,
+    ):
+        self._embedder = embedding_generator or EmbeddingGenerator()
+        self._vectorstore = vector_store or VectorStore()
+
+    async def retrieve(
+        self,
+        query: str,
+        project_id: str,
+        top_k: int = 10,
+        section_filter: Optional[str] = None,
+        min_score: Optional[float] = None,
+    ) -> list[RetrievalResult]:
+        """
+        Retrieve relevant chunks for a query.
+
+        Args:
+            query: Natural language search query.
+            project_id: Project ID for tenant isolation.
+            top_k: Maximum number of results to return.
+            section_filter: Optional section name filter (e.g., "methods").
+            min_score: Minimum similarity score (default: 0.5).
+
+        Returns:
+            List of RetrievalResult sorted by descending score.
+        """
+        threshold = min_score or self.MIN_SCORE_THRESHOLD
+
+        logger.info(
+            "retrieval_started",
+            query_preview=query[:100],
+            project_id=project_id,
+            top_k=top_k,
+            section_filter=section_filter,
+        )
+
+        # Generate query embedding with BGE instruction prefix
+        prefixed_query = f"{self.QUERY_PREFIX}{query}"
+        query_embedding = await self._embedder.generate_single(prefixed_query)
+
+        # Search Pinecone
+        search_results = await self._vectorstore.search(
+            query_embedding=query_embedding,
+            project_id=project_id,
+            top_k=top_k * 2,  # Over-fetch for filtering
+            section_filter=section_filter,
+        )
+
+        # Filter by score threshold
+        filtered = [
+            r for r in search_results
+            if r.score >= threshold
+        ]
+
+        # Deduplicate by paper_id (keep highest score per paper)
+        deduplicated = self._deduplicate_by_paper(filtered)
+
+        # Convert to RetrievalResult
+        results = []
+        for sr in deduplicated[:top_k]:
+            results.append(RetrievalResult(
+                text=sr.chunk_text,
+                score=sr.score,
+                paper_id=sr.paper_id,
+                doi=sr.doi,
+                title=sr.title,
+                section=sr.section,
+                chunk_index=sr.chunk_index,
+                metadata={"source": "pinecone"},
+            ))
+
+        logger.info(
+            "retrieval_completed",
+            query_preview=query[:80],
+            total_raw=len(search_results),
+            after_filter=len(filtered),
+            after_dedup=len(results),
+        )
+
+        return results
+
+    async def retrieve_with_context(
+        self,
+        query: str,
+        project_id: str,
+        top_k: int = 5,
+    ) -> list[RetrievalResult]:
+        """
+        Retrieve results with extended context.
+
+        Fetches neighboring chunks for each top result to provide
+        more context around the matched passage.
+
+        Args:
+            query: Search query.
+            project_id: Project ID for isolation.
+            top_k: Number of results.
+
+        Returns:
+            Retrieval results with expanded text context.
+        """
+        results = await self.retrieve(
+            query=query,
+            project_id=project_id,
+            top_k=top_k,
+        )
+
+        # For each result, try to fetch adjacent chunks for context
+        enriched_results = []
+        for result in results:
+            # Fetch the previous and next chunks from the same paper
+            context_chunks = await self._fetch_adjacent_chunks(
+                paper_id=result.paper_id,
+                chunk_index=result.chunk_index,
+                project_id=project_id,
+            )
+
+            # Build extended text
+            extended_parts = []
+            if context_chunks.get("previous"):
+                extended_parts.append(context_chunks["previous"])
+            extended_parts.append(result.text)
+            if context_chunks.get("next"):
+                extended_parts.append(context_chunks["next"])
+
+            enriched_result = RetrievalResult(
+                text="\n\n".join(extended_parts),
+                score=result.score,
+                paper_id=result.paper_id,
+                doi=result.doi,
+                title=result.title,
+                authors=result.authors,
+                section=result.section,
+                chunk_index=result.chunk_index,
+                metadata={**result.metadata, "context_enriched": True},
+            )
+            enriched_results.append(enriched_result)
+
+        return enriched_results
+
+    async def multi_query_retrieve(
+        self,
+        queries: list[str],
+        project_id: str,
+        top_k: int = 10,
+    ) -> list[RetrievalResult]:
+        """
+        Retrieve using multiple query variants and merge results.
+
+        Useful when a single query may not capture all relevant aspects.
+        Results are merged by score with cross-query deduplication.
+
+        Args:
+            queries: List of query variants.
+            project_id: Project ID.
+            top_k: Max total results after merging.
+
+        Returns:
+            Merged and deduplicated results.
+        """
+        # Run all queries in parallel
+        tasks = [
+            self.retrieve(q, project_id, top_k=top_k)
+            for q in queries
+        ]
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Merge all results
+        merged = []
+        for result_set in all_results:
+            if isinstance(result_set, Exception):
+                logger.warning("multi_query_partial_failure", error=str(result_set))
+                continue
+            merged.extend(result_set)
+
+        # Deduplicate across queries (by text content hash)
+        seen_texts = set()
+        unique = []
+        for r in sorted(merged, key=lambda x: x.score, reverse=True):
+            text_key = r.text[:200]  # Use first 200 chars as dedup key
+            if text_key not in seen_texts:
+                seen_texts.add(text_key)
+                unique.append(r)
+
+        return unique[:top_k]
+
+    def _deduplicate_by_paper(self, results) -> list:
+        """
+        Keep only the highest-scoring chunk per paper.
+
+        For diverse results, we want at most one chunk per paper
+        in the top results.
+        """
+        best_per_paper: dict[str, object] = {}
+        for r in results:
+            paper_key = r.paper_id
+            if paper_key not in best_per_paper or r.score > best_per_paper[paper_key].score:
+                best_per_paper[paper_key] = r
+
+        # Sort by score descending
+        return sorted(best_per_paper.values(), key=lambda x: x.score, reverse=True)
+
+    async def _fetch_adjacent_chunks(
+        self,
+        paper_id: str,
+        chunk_index: int,
+        project_id: str,
+    ) -> dict[str, str]:
+        """
+        Fetch previous and next chunks for context expansion.
+
+        Returns dict with 'previous' and 'next' text if available.
+        """
+        context = {}
+
+        for offset, key in [(-1, "previous"), (1, "next")]:
+            target_index = chunk_index + offset
+            if target_index < 0:
+                continue
+
+            try:
+                # Search for the specific chunk by metadata filter
+                results = await self._vectorstore.search(
+                    query_embedding=[0.0] * 1024,  # Dummy — we filter by metadata
+                    project_id=project_id,
+                    top_k=1,
+                    metadata_filter={
+                        "paper_id": paper_id,
+                        "chunk_index": target_index,
+                    },
+                )
+                if results:
+                    context[key] = results[0].chunk_text
+            except Exception:
+                # Adjacent chunk not found — skip gracefully
+                pass
+
+        return context
+
+============================================================
+FILE: app\rag\vectorstore.py
+============================================================
+"""Pinecone vector-store operations for the ResearchOS RAG pipeline.
+
+Wraps :class:`~app.integrations.pinecone_client.PineconeManager` with
+higher-level operations for indexing papers and searching by project
+scope.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from app.core.exceptions import VectorStoreError
+from app.integrations.pinecone_client import PineconeManager, QueryResult
+from app.rag.chunking import TextChunk
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResult:
+    """A single search result from the vector store.
+
+    Attributes:
+        chunk_text: The text of the matched chunk.
+        score: Cosine-similarity score (0–1).
+        paper_id: Identifier of the source paper.
+        doi: Digital Object Identifier (if available).
+        title: Paper title.
+        section: Section name the chunk belongs to.
+        chunk_index: Index of the chunk within the paper.
+    """
+
+    chunk_text: str
+    score: float
+    paper_id: str = ""
+    doi: str = ""
+    title: str = ""
+    section: str = ""
+    chunk_index: int = 0
+
+
+class VectorStore:
+    """High-level vector store backed by Pinecone.
+
+    Usage::
+
+        vs = VectorStore()
+        await vs.index_paper("paper-123", chunks, embeddings, metadata)
+        results = await vs.search(query_vec, project_id="proj-1")
+    """
+
+    def __init__(self, pinecone: PineconeManager | None = None) -> None:
+        self._pinecone = pinecone or PineconeManager()
+        self._initialized = False
+
+    # ------------------------------------------------------------------
+    # Indexing
+    # ------------------------------------------------------------------
+
+    async def index_paper(
+        self,
+        paper_id: str,
+        chunks: list[TextChunk],
+        embeddings: list[list[float]],
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Index all chunks of a paper into Pinecone.
+
+        Args:
+            paper_id: Unique paper identifier.
+            chunks: Text chunks produced by the chunker.
+            embeddings: Corresponding embedding vectors (same order and
+                length as *chunks*).
+            metadata: Paper-level metadata merged into each vector's
+                metadata (e.g. title, doi, authors, project_id).
+
+        Returns:
+            Number of vectors successfully upserted.
+
+        Raises:
+            VectorStoreError: If chunk/embedding counts don't match or
+                upsert fails.
+        """
+        if len(chunks) != len(embeddings):
+            raise VectorStoreError(
+                f"Chunk count ({len(chunks)}) != embedding count "
+                f"({len(embeddings)})"
+            )
+
+        metadata = metadata or {}
+
+        vectors: list[dict[str, Any]] = []
+        for chunk, embedding in zip(chunks, embeddings):
+            vector_id = f"{paper_id}_{chunk.chunk_index}_{uuid.uuid4().hex[:8]}"
+            vec_metadata = {
+                **metadata,
+                "paper_id": paper_id,
+                "chunk_index": chunk.chunk_index,
+                "section": chunk.section or "",
+                "chunk_text": chunk.text[:1000],  # Pinecone metadata limit
+                "token_count": chunk.token_count,
+            }
+            # Merge chunk-level metadata.
+            for k, v in chunk.metadata.items():
+                if k not in vec_metadata:
+                    vec_metadata[k] = v
+
+            vectors.append(
+                {
+                    "id": vector_id,
+                    "values": embedding,
+                    "metadata": vec_metadata,
+                }
+            )
+
+        count = await self._pinecone.upsert_vectors(vectors)
+        logger.info(
+            "vectorstore.paper_indexed",
+            paper_id=paper_id,
+            chunks=len(chunks),
+            indexed=count,
+        )
+        return count
+
+    async def index_chunks(
+        self,
+        chunks_with_embeddings: list[dict[str, Any]],
+    ) -> int:
+
+        if not self._initialized:
+            await self._pinecone.init_index()
+            self._initialized = True
+
+        if not chunks_with_embeddings:
+            return 0
+
+        count = await self._pinecone.upsert_vectors(chunks_with_embeddings)
+
+        logger.info("vectorstore.chunks_indexed", count=count)
+
+        return count
+        
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    async def search(
+        self,
+        query_embedding: list[float],
+        project_id: str | None = None,
+        top_k: int = 10,
+        section_filter: str | None = None,
+    ) -> list[SearchResult]:
+        """Search the vector store for chunks similar to *query_embedding*.
+
+        Args:
+            query_embedding: The query vector.
+            project_id: Optional project scope filter.
+            top_k: Maximum results to return.
+            section_filter: Optional section name filter (e.g.
+                ``"methods"``).
+
+        Returns:
+            Ranked list of :class:`SearchResult` objects.
+        """
+        metadata_filter: dict[str, Any] = {}
+        if project_id:
+            metadata_filter["project_id"] = {"$eq": project_id}
+        if section_filter:
+            metadata_filter["section"] = {"$eq": section_filter}
+
+        query_results: list[QueryResult] = await self._pinecone.query(
+            vector=query_embedding,
+            top_k=top_k,
+            filter=metadata_filter if metadata_filter else None,
+            include_metadata=True,
+        )
+
+        results: list[SearchResult] = []
+        for qr in query_results:
+            meta = qr.metadata
+            results.append(
+                SearchResult(
+                    chunk_text=meta.get("chunk_text", ""),
+                    score=qr.score,
+                    paper_id=meta.get("paper_id", ""),
+                    doi=meta.get("doi", ""),
+                    title=meta.get("title", ""),
+                    section=meta.get("section", ""),
+                    chunk_index=int(meta.get("chunk_index", 0)),
+                )
+            )
+
+        logger.debug(
+            "vectorstore.search_complete",
+            top_k=top_k,
+            returned=len(results),
+            project_id=project_id,
+        )
+        return results
+
+    # ------------------------------------------------------------------
+    # Deletion
+    # ------------------------------------------------------------------
+
+    async def delete_paper(self, paper_id: str) -> None:
+        """Delete all vectors belonging to a paper.
+
+        Args:
+            paper_id: The paper identifier whose chunks should be
+                removed.
+        """
+        await self._pinecone.delete_by_filter(
+            {"paper_id": {"$eq": paper_id}}
+        )
+        logger.info("vectorstore.paper_deleted", paper_id=paper_id)
+
+============================================================
+FILE: app\rag\embeddings.py
+============================================================
+"""Embedding generation wrapper using BAAI/bge-large-en-v1.5.
+
+Loads the ``sentence-transformers`` model **once** via a singleton
+pattern and exposes an async interface by running the synchronous
+encode calls in ``asyncio.to_thread()``.
+
+For **query** embeddings the BGE instruction prefix is automatically
+prepended:  ``"Represent this sentence for searching relevant passages: "``.
+For **document** embeddings no prefix is added.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import numpy as np
+
+from app.config import get_settings
+from app.core.exceptions import EmbeddingError
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+_BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+
+class EmbeddingGenerator:
+    """Singleton embedding generator backed by ``sentence-transformers``.
+
+    Usage::
+
+        gen = EmbeddingGenerator()
+        vecs = await gen.generate(["hello world", "foo bar"])
+        qvec = await gen.generate_query("What is attention?")
+    """
+
+    _instance: EmbeddingGenerator | None = None
+    _lock: asyncio.Lock = asyncio.Lock()
+
+    def __new__(cls) -> EmbeddingGenerator:  # noqa: D102
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False  # type: ignore[attr-defined]
+        return cls._instance
+
+    def __init__(self) -> None:
+        if self._initialized:  # type: ignore[attr-defined]
+            return
+        self._initialized = True
+        self._model: Any = None
+        self._model_name: str = ""
+        self._batch_size: int = 32
+        self._dimension: int = 1024
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
+    async def _ensure_model(self) -> None:
+        """Load the sentence-transformer model if not already loaded."""
+        if self._model is not None:
+            return
+
+        async with self._lock:
+            if self._model is not None:
+                return
+
+            settings = get_settings()
+            self._model_name = settings.embedding_model or "BAAI/bge-large-en-v1.5"
+            device = settings.embedding_device or "cpu"
+            self._dimension = int(settings.embedding_dimension or 1024)
+
+            import time
+            logger.info(
+                "embeddings.loading_model",
+                model=self._model_name,
+                device=device,
+            )
+            start_time = time.perf_counter()
+
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                self._model = await asyncio.to_thread(
+                    SentenceTransformer,
+                    self._model_name,
+                    device=device,
+                )
+                duration = time.perf_counter() - start_time
+                logger.info(
+                    "embeddings.model_loaded",
+                    model=self._model_name,
+                    dimension=self._dimension,
+                    duration_seconds=round(duration, 2),
+                )
+            except Exception as exc:
+                logger.error(
+                    "embeddings.model_load_failed",
+                    model=self._model_name,
+                    error=str(exc),
+                )
+                raise EmbeddingError(
+                    f"Failed to load embedding model '{self._model_name}': {exc}"
+                ) from exc
+
+    # ------------------------------------------------------------------
+    # Internal encode
+    # ------------------------------------------------------------------
+
+    def _encode_sync(
+        self,
+        texts: list[str],
+        normalize: bool = True,
+    ) -> list[list[float]]:
+        """Synchronous encode — called from a worker thread."""
+        embeddings: np.ndarray = self._model.encode(
+            texts,
+            batch_size=self._batch_size,
+            show_progress_bar=False,
+            normalize_embeddings=normalize,
+            convert_to_numpy=True,
+        )
+        return embeddings.tolist()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def generate(
+        self,
+        texts: list[str],
+        *,
+        normalize: bool = True,
+    ) -> list[list[float]]:
+        """Generate embeddings for a list of **document** texts.
+
+        No instruction prefix is prepended — use :meth:`generate_query`
+        for query embeddings.
+
+        Args:
+            texts: List of texts to embed.
+            normalize: L2-normalise the output vectors (default
+                ``True``).
+
+        Returns:
+            List of embedding vectors (each a ``list[float]`` of length
+            ``EMBEDDING_DIMENSION``).
+
+        Raises:
+            EmbeddingError: On model or encoding failure.
+        """
+        if not texts:
+            return []
+
+        await self._ensure_model()
+
+        try:
+            embeddings = await asyncio.to_thread(
+                self._encode_sync, texts, normalize
+            )
+            logger.debug(
+                "embeddings.generated",
+                count=len(embeddings),
+                dim=len(embeddings[0]) if embeddings else 0,
+            )
+            return embeddings
+        except Exception as exc:
+            logger.error("embeddings.generate_failed", error=str(exc))
+            raise EmbeddingError(
+                f"Embedding generation failed: {exc}"
+            ) from exc
+
+    async def generate_single(
+        self,
+        text: str,
+        *,
+        normalize: bool = True,
+    ) -> list[float]:
+        """Generate an embedding for a single **document** text.
+
+        Convenience wrapper around :meth:`generate`.
+        """
+        results = await self.generate([text], normalize=normalize)
+        return results[0]
+
+    async def generate_query(
+        self,
+        query: str,
+        *,
+        normalize: bool = True,
+    ) -> list[float]:
+        """Generate an embedding for a **query** text.
+
+        The BGE instruction prefix is automatically prepended.
+
+        Args:
+            query: The search query.
+            normalize: L2-normalise the output vector.
+
+        Returns:
+            A single embedding vector.
+        """
+        prefixed = f"{_BGE_QUERY_PREFIX}{query}"
+        results = await self.generate([prefixed], normalize=normalize)
+        return results[0]
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def dimension(self) -> int:
+        """Embedding vector dimension."""
+        return self._dimension
+
+    @property
+    def model_name(self) -> str:
+        """Name of the loaded model."""
+        return self._model_name

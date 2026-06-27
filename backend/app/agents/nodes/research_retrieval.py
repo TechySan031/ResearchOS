@@ -12,12 +12,13 @@ This node is responsible for:
 from __future__ import annotations
 
 import asyncio
+
 import datetime as _dt
 import hashlib
 import json
 import re
+import time
 from typing import Any
-
 from app.agents.state import ResearchState
 from app.core.events import EventBus, AgentEvent
 from app.integrations.arxiv_client import ArxivClient
@@ -252,16 +253,15 @@ async def _index_papers(
                 }
             )
 
-        logger.info(
-            ".embedding_start",
-            paper_count=len(texts),
-        )
+        logger.info("=== STARTING EMBEDDINGS ===")
+
+        embedding_start = time.perf_counter()
 
         vectors = await embedder.generate(texts)
 
         logger.info(
-            ".embedding_complete",
-            vectors=len(vectors),
+            "=== EMBEDDINGS COMPLETE ===",
+            duration_seconds=round(time.perf_counter() - embedding_start, 2),
         )
 
         def sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -303,17 +303,17 @@ async def _index_papers(
                 }
             )
 
-        logger.info(
-            ".upsert_ready",
-            vectors=len(chunks_with_embeddings),
-        )
+        logger.info("=== STARTING PINECONE UPSERT ===")
+
+        pinecone_start = time.perf_counter()
+
         count = await store.index_chunks(chunks_with_embeddings)
 
         logger.info(
-            ".indexed_papers",
-            count=count,
-            project_id=project_id,
+            "=== PINECONE UPSERT COMPLETE ===",
+            duration_seconds=round(time.perf_counter() - pinecone_start, 2),
         )
+        
         return True
 
     except Exception as exc:
@@ -372,16 +372,29 @@ async def _node(state: ResearchState) -> dict[str, Any]:
     logger.info("research_retrieval.queries", queries=queries)
 
     # 2. Search all sources in parallel for each query
-    per_query_limit = 15
+    per_query_limit = 5
     search_coros: list[Any] = []
     for q in queries:
         search_coros.append(_search_arxiv(q, per_query_limit))
         search_coros.append(_search_semantic_scholar(q, per_query_limit))
         search_coros.append(_search_crossref(q, per_query_limit))
+    
+    logger.info("=== STARTING PAPER SEARCH ===")
+    search_start = time.perf_counter()
+    # Give every provider a maximum of 15 seconds
+    timed_coros = [
+        asyncio.wait_for(coro, timeout=15)
+        for coro in search_coros
+    ]
 
-    logger.info("research_retrieval.initiating_parallel_searches", coro_count=len(search_coros))
-    all_results = await asyncio.gather(*search_coros, return_exceptions=True)
-    logger.info("research_retrieval.parallel_searches_completed", result_count=len(all_results))
+    all_results = await asyncio.gather(
+        *timed_coros,
+        return_exceptions=True,
+    )
+    logger.info(
+        "=== PAPER SEARCH COMPLETE ===",
+        duration_seconds=round(time.perf_counter() - search_start, 2),
+    )
 
     # Flatten, skipping exceptions
     all_papers: list[dict[str, Any]] = []
@@ -413,6 +426,9 @@ async def _node(state: ResearchState) -> dict[str, Any]:
 
     # 4. Rank
     ranked_papers = _rank_papers(unique_papers)
+    
+    # limit to 30 papers
+    ranked_papers = ranked_papers[:30] 
 
     # 5. Index into vector store
     logger.info("research_retrieval.starting_indexing", paper_count=len(ranked_papers))
@@ -451,7 +467,7 @@ async def _node(state: ResearchState) -> dict[str, Any]:
     return {
         "retrieved_papers": ranked_papers,
         "paper_embeddings_stored": embeddings_stored,
-        "current_agent": "",
+        "current_agent": "research_retrieval",
         "agent_history": [
             {
                 "agent": "research_retrieval",

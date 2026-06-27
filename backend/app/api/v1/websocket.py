@@ -99,14 +99,9 @@ manager = ConnectionManager()
 
 
 async def _relay_agent_events(project_id: str):
-    """
-    Background task that relays Redis pub-sub agent events to
-    WebSocket clients for a specific project.
-
-    Runs until no clients are connected or an error occurs.
-    """
     try:
         async for event in subscribe_agent_events(project_id=project_id):
+
             if manager.get_connection_count(project_id) == 0:
                 logger.info(
                     "stopping_event_relay_no_clients",
@@ -114,15 +109,32 @@ async def _relay_agent_events(project_id: str):
                 )
                 break
 
-            await manager.broadcast(project_id, {
-                "type": event.event_type,
-                "agent": event.agent_name,
-                "data": event.data,
-                "timestamp": event.timestamp,
-                "project_id": project_id,
-            })
+            event_type = event.event_type
+
+            if event_type == "started":
+                event_type = "agent_started"
+            elif event_type == "completed":
+                event_type = "agent_completed"
+            elif event_type == "failed":
+                event_type = "agent_error"
+
+            await manager.broadcast(
+                project_id,
+                {
+                    "type": event_type,
+                    "agent": event.agent_name,
+                    "data": {
+                        **event.data,
+                        "current_agent": event.agent_name,
+                    },
+                    "timestamp": event.timestamp,
+                    "project_id": project_id,
+                },
+            )
+
     except asyncio.CancelledError:
         logger.info("event_relay_cancelled", project_id=project_id)
+
     except Exception as e:
         logger.error(
             "event_relay_error",

@@ -1,0 +1,1410 @@
+﻿
+============================================================
+FILE: backend\app\agents\nodes\research_retrieval.py
+============================================================
+"""Research retrieval node for the LangGraph workflow.
+
+This node is responsible for:
+1.  Formulating multiple diverse search queries from the research topic.
+2.  Querying arXiv, Semantic Scholar, and CrossRef **in parallel**.
+3.  Deduplicating results by DOI / normalised title.
+4.  Ranking papers by citation count Ã— relevance.
+5.  Indexing papers into the Pinecone vector store via the RAG pipeline.
+6.  Publishing agent events via the EventBus.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as _dt
+import hashlib
+import json
+import re
+from typing import Any
+
+from app.agents.state import ResearchState
+from app.core.events import EventBus, AgentEvent
+from app.integrations.arxiv_client import ArxivClient
+from app.integrations.semantic_scholar_client import SemanticScholarClient
+from app.integrations.crossref_client import CrossRefClient
+from app.rag.embeddings import EmbeddingGenerator
+from app.rag.vectorstore import VectorStore
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+_STOP_WORDS = frozenset(
+    {"a", "an", "the", "of", "and", "in", "to", "for", "on", "with", "is", "at", "by"}
+)
+
+
+def _normalise_title(title: str) -> str:
+    """Lower-case, strip punctuation and stop-words for dedup matching."""
+    title = title.lower().strip()
+    title = re.sub(r"[^a-z0-9\s]", "", title)
+    tokens = [t for t in title.split() if t not in _STOP_WORDS]
+    return " ".join(tokens)
+
+
+def _title_hash(title: str) -> str:
+    return hashlib.md5(_normalise_title(title).encode()).hexdigest()
+
+
+def _generate_queries(topic: str) -> list[str]:
+    """Generate 3-5 diverse search query variants from a topic string.
+
+    We apply simple heuristic transformations so the retrieval node can
+    work even without an LLM call.
+    """
+    queries: list[str] = [topic]
+
+    # Broader variant
+    broad = re.sub(r"\b(using|via|with|based on)\b", "", topic, flags=re.I).strip()
+    if broad and broad != topic:
+        queries.append(broad)
+
+    # More specific: add "survey" / "review"
+    queries.append(f"{topic} survey review")
+
+    # Methodological variant
+    queries.append(f"{topic} methods approaches techniques")
+
+    # Recent advances
+    queries.append(f"recent advances {topic}")
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for q in queries:
+        q_norm = q.lower().strip()
+        if q_norm not in seen:
+            seen.add(q_norm)
+            unique.append(q)
+
+    return unique[:5]
+
+
+def _deduplicate_papers(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate papers by DOI first, then by normalised title hash."""
+    seen_dois: set[str] = set()
+    seen_titles: set[str] = set()
+    unique: list[dict[str, Any]] = []
+
+    for paper in papers:
+        doi = (paper.get("doi") or "").strip().lower()
+        t_hash = _title_hash(paper.get("title", ""))
+
+        if doi and doi in seen_dois:
+            continue
+        if t_hash in seen_titles:
+            continue
+
+        if doi:
+            seen_dois.add(doi)
+        seen_titles.add(t_hash)
+        unique.append(paper)
+
+    return unique
+
+
+def _rank_papers(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank papers by citation count (descending), breaking ties by year."""
+    return sorted(
+        papers,
+        key=lambda p: (
+            -(p.get("citation_count") or 0),
+            -(p.get("year") or 0),
+        ),
+    )
+
+
+# â”€â”€ Source search helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+async def _search_arxiv(query: str, max_results: int) -> list[dict[str, Any]]:
+    """Search arXiv, returning normalised paper dicts."""
+    try:
+        client = ArxivClient()
+        raw = await client.search(query=query, max_results=max_results)
+        results: list[dict[str, Any]] = []
+        for p in raw:
+            results.append(
+                {
+                    "title": p.title,
+                    "authors": p.authors,
+                    "abstract": p.abstract,
+                    "year": p.published.year if p.published else None,
+                    "doi": p.doi,
+                    "arxiv_id": p.id,
+                    "source": "arxiv",
+                    "citation_count": 0,
+                    "url": p.pdf_url,
+                }
+            )
+        return results
+    except Exception as exc:
+        logger.error(".arxiv_error", error=str(exc), query=query)
+        return []
+
+
+async def _search_semantic_scholar(
+    query: str, max_results: int
+) -> list[dict[str, Any]]:
+    """Search Semantic Scholar, returning normalised paper dicts."""
+    try:
+        client = SemanticScholarClient()
+        raw = await client.search(query=query, limit=max_results)
+        results: list[dict[str, Any]] = []
+        for p in raw:
+            results.append(
+                {
+                    "title": p.title,
+                    "authors": [
+                        a.get("name", a) if isinstance(a, dict) else str(a)
+                        for a in p.authors
+                    ],
+                    "abstract": p.abstract or "",
+                    "year": p.year,
+                    "doi": p.doi or p.externalIds.get("DOI"),
+                    "semantic_scholar_id": p.paperId,
+                    "source": "semantic_scholar",
+                    "citation_count": p.citationCount,
+                    "url": p.url,
+                }
+            )
+        return results
+    except Exception as exc:
+        logger.error(
+            ".semantic_scholar_error",
+            error=str(exc),
+            query=query,
+        )
+        return []
+
+
+async def _search_crossref(query: str, max_results: int) -> list[dict[str, Any]]:
+    """Search CrossRef, returning normalised paper dicts."""
+    try:
+        client = CrossRefClient()
+        raw = await client.search(query=query, rows=max_results)
+        results: list[dict[str, Any]] = []
+        for w in raw:
+            year = None
+            if w.published_date:
+                try:
+                    year = int(w.published_date.split("-")[0])
+                except (ValueError, IndexError):
+                    pass
+
+            results.append(
+                {
+                    "title": w.title,
+                    "authors": [
+                        f"{a.get('given', '')} {a.get('family', '')}".strip()
+                        for a in w.authors
+                    ],
+                    "abstract": w.abstract or "",
+                    "year": year,
+                    "doi": w.doi,
+                    "source": "crossref",
+                    "citation_count": w.is_referenced_by_count,
+                    "url": w.url,
+                }
+            )
+        return results
+    except Exception as exc:
+        logger.error(
+            ".crossref_error", error=str(exc), query=query
+        )
+        return []
+
+
+# â”€â”€ Embedding helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+async def _index_papers(
+    papers: list[dict[str, Any]], project_id: str
+) -> bool:
+    """Embed and upsert papers into the vector store.
+
+    Returns ``True`` on success, ``False`` on failure.
+    """
+    if not papers:
+        return True
+
+    try:
+        embedder = EmbeddingGenerator()
+        store = VectorStore()
+
+        texts: list[str] = []
+        metadatas: list[dict[str, Any]] = []
+
+        for paper in papers:
+            # Combine title + abstract for embedding
+            text = f"{paper.get('title', '') or ''}\n\n{paper.get('abstract', '') or ''}"
+            texts.append(text)
+            metadatas.append(
+                {
+                    "paper_title": paper.get("title", "") or "",
+                    "doi": paper.get("doi", "") or "",
+                    "authors": [str(a) for a in (paper.get("authors") or [])],
+                    "year": paper.get("year") or "",
+                    "source": paper.get("source", "") or "",
+                    "project_id": project_id,
+                }
+            )
+
+        logger.info(
+            ".embedding_start",
+            paper_count=len(texts),
+        )
+
+        vectors = await embedder.generate(texts)
+
+        logger.info(
+            ".embedding_complete",
+            vectors=len(vectors),
+        )
+
+        def sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+            cleaned: dict[str, Any] = {}
+
+            for key, value in metadata.items():
+
+                if value is None:
+                    cleaned[key] = ""
+
+                elif isinstance(value, (str, int, float, bool)):
+                    cleaned[key] = value
+
+                elif isinstance(value, list):
+                    cleaned[key] = [str(v) for v in value if v is not None]
+
+                else:
+                    cleaned[key] = str(value)
+
+            return cleaned
+            
+        chunks_with_embeddings = []
+
+        for i, (vector, text, metadata) in enumerate(
+            zip(vectors, texts, metadatas)
+        ):
+            safe_metadata = sanitize_metadata(
+                {
+                    **metadata,
+                    "chunk_text": text[:1000],
+                }
+            )
+
+            chunks_with_embeddings.append(
+                {
+                    "id": f"{project_id}-{i}",
+                    "values": vector,
+                    "metadata": safe_metadata,
+                }
+            )
+
+        logger.info(
+            ".upsert_ready",
+            vectors=len(chunks_with_embeddings),
+        )
+        count = await store.index_chunks(chunks_with_embeddings)
+
+        logger.info(
+            ".indexed_papers",
+            count=count,
+            project_id=project_id,
+        )
+        return True
+
+    except Exception as exc:
+        logger.error(
+            ".index_error",
+            error=str(exc),
+            project_id=project_id,
+        )
+        return False
+
+
+# â”€â”€ Main node function â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+async def _node(state: ResearchState) -> dict[str, Any]:
+    """LangGraph node: retrieve and index academic papers.
+
+    Args:
+        state: The current workflow state.
+
+    Returns:
+        A dict of state updates containing ``retrieved_papers``,
+        ``paper_embeddings_stored``, ``current_agent``, ``agent_history``,
+        and ``status``.
+    """
+    topic: str = state.get("topic", "")
+    project_id: str = state.get("project_id", "")
+    start_time = _dt.datetime.now(_dt.timezone.utc)
+
+    logger.info(
+        "research_retrieval.start",
+        topic=topic,
+        project_id=project_id,
+    )
+
+    # Publish start event
+    try:
+        logger.info("research_retrieval.publishing_start_event", project_id=project_id)
+        event_bus = EventBus()
+        await event_bus.publish(
+            AgentEvent(
+                agent_name="research_retrieval",
+                event_type="agent_started",
+                project_id=project_id,
+                data={"topic": topic},
+            )
+        )
+        logger.info("research_retrieval.published_start_event", project_id=project_id)
+    except Exception as exc:
+        logger.warning("research_retrieval.event_publish_failed", error=str(exc))
+
+    errors: list[dict[str, Any]] = []
+
+    # 1. Generate search queries
+    queries = _generate_queries(topic)
+    logger.info("research_retrieval.queries", queries=queries)
+
+    # 2. Search all sources in parallel for each query
+    per_query_limit = 15
+    search_coros: list[Any] = []
+    for q in queries:
+        search_coros.append(_search_arxiv(q, per_query_limit))
+        search_coros.append(_search_semantic_scholar(q, per_query_limit))
+        search_coros.append(_search_crossref(q, per_query_limit))
+
+    logger.info("research_retrieval.initiating_parallel_searches", coro_count=len(search_coros))
+    all_results = await asyncio.gather(*search_coros, return_exceptions=True)
+    logger.info("research_retrieval.parallel_searches_completed", result_count=len(all_results))
+
+    # Flatten, skipping exceptions
+    all_papers: list[dict[str, Any]] = []
+    for result in all_results:
+        if isinstance(result, BaseException):
+            logger.error("research_retrieval.search_coroutine_failed", error=str(result))
+            errors.append(
+                {
+                    "agent": "research_retrieval",
+                    "error": str(result),
+                    "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                }
+            )
+            continue
+        if isinstance(result, list):
+            all_papers.extend(result)
+
+    logger.info(
+        "research_retrieval.raw_count",
+        raw_count=len(all_papers),
+    )
+
+    # 3. Deduplicate
+    unique_papers = _deduplicate_papers(all_papers)
+    logger.info(
+        "research_retrieval.dedup_count",
+        dedup_count=len(unique_papers),
+    )
+
+    # 4. Rank
+    ranked_papers = _rank_papers(unique_papers)
+
+    # 5. Index into vector store
+    logger.info("research_retrieval.starting_indexing", paper_count=len(ranked_papers))
+    embeddings_stored = await _index_papers(ranked_papers, project_id)
+    logger.info("research_retrieval.indexing_completed", success=embeddings_stored)
+
+    elapsed = (_dt.datetime.now(_dt.timezone.utc) - start_time).total_seconds()
+
+    # Publish completion event
+    try:
+        logger.info("research_retrieval.publishing_completion_event", project_id=project_id)
+        event_bus = EventBus()
+        await event_bus.publish(
+            AgentEvent(
+                agent_name="research_retrieval",
+                event_type="agent_completed",
+                project_id=project_id,
+                data={
+                    "paper_count": len(ranked_papers),
+                    "embeddings_stored": embeddings_stored,
+                    "elapsed_seconds": elapsed,
+                },
+            )
+        )
+        logger.info("research_retrieval.published_completion_event", project_id=project_id)
+    except Exception as exc:
+        logger.warning("research_retrieval.event_publish_failed", error=str(exc))
+
+    logger.info(
+        "research_retrieval.complete",
+        paper_count=len(ranked_papers),
+        embeddings_stored=embeddings_stored,
+        elapsed_seconds=elapsed,
+    )
+
+    return {
+        "retrieved_papers": ranked_papers,
+        "paper_embeddings_stored": embeddings_stored,
+        "current_agent": "",
+        "agent_history": [
+            {
+                "agent": "research_retrieval",
+                "status": "completed",
+                "paper_count": len(ranked_papers),
+                "queries_used": queries,
+                "elapsed_seconds": elapsed,
+                "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            }
+        ],
+        "errors": errors,
+        "status": "papers_retrieved",
+    }
+
+# LangGraph export
+research_retrieval_node = _node
+    
+
+============================================================
+FILE: backend\app\agents\graph.py
+============================================================
+"""LangGraph workflow builder for ResearchOS.
+
+Constructs the full multi-agent research workflow graph with all nodes,
+conditional edges (driven by the deterministic supervisor), and
+checkpointing.
+
+All 11 agent nodes are now real implementations backed by LLM calls
+(Mistral / Kimi) â€” no more placeholders.
+
+Usage::
+
+    graph = build_research_graph()
+    final_state = await run_workflow("quantum computing survey", "proj-123")
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+from typing import Any
+import traceback
+# pyrefly: ignore [missing-import]
+from langgraph.graph import StateGraph, END
+# pyrefly: ignore [missing-import]
+from langgraph.checkpoint.memory import MemorySaver
+
+from app.agents.state import ResearchState
+from app.agents.supervisor import route
+from app.agents.nodes import (
+    research_retrieval_node,
+    literature_review_node,
+    citation_verification_node,
+    gap_analysis_node,
+    methodology_suggestion_node,
+    draft_writing_node,
+    hallucination_detection_node,
+    formatting_node,
+    journal_recommendation_node,
+    reviewer_simulation_node,
+    submission_preparation_node,
+)
+from app.core.events import EventBus, AgentEvent
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+import time
+
+# â”€â”€ Build the compiled graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+def build_research_graph() -> Any:
+    """Construct and compile the LangGraph research workflow.
+
+    Returns:
+        A compiled LangGraph ``CompiledGraph`` with ``MemorySaver``
+        checkpointing enabled.
+    """
+    workflow = StateGraph(ResearchState)
+
+    # â”€â”€ Register all agent nodes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    workflow.add_node("research_retrieval", research_retrieval_node)
+    workflow.add_node("literature_review", literature_review_node)
+    workflow.add_node("citation_verification", citation_verification_node)
+    workflow.add_node("gap_analysis", gap_analysis_node)
+    workflow.add_node("methodology_suggestion", methodology_suggestion_node)
+    workflow.add_node("draft_writing", draft_writing_node)
+    workflow.add_node("hallucination_detection", hallucination_detection_node)
+    workflow.add_node("formatting", formatting_node)
+    workflow.add_node("journal_recommendation", journal_recommendation_node)
+    workflow.add_node("reviewer_simulation", reviewer_simulation_node)
+    workflow.add_node("submission_preparation", submission_preparation_node)
+
+    # â”€â”€ Virtual supervisor node (conditional routing) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    workflow.add_node("supervisor", _supervisor_node)
+
+    # â”€â”€ Entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    workflow.set_entry_point("supervisor")
+
+    # â”€â”€ Conditional edges from supervisor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    workflow.add_conditional_edges(
+        "supervisor",
+        route,
+        {
+            "research_retrieval": "research_retrieval",
+            "literature_review": "literature_review",
+            "citation_verification": "citation_verification",
+            "gap_analysis": "gap_analysis",
+            "methodology_suggestion": "methodology_suggestion",
+            "draft_writing": "draft_writing",
+            "hallucination_detection": "hallucination_detection",
+            "formatting": "formatting",
+            "journal_recommendation": "journal_recommendation",
+            "reviewer_simulation": "reviewer_simulation",
+            "submission_preparation": "submission_preparation",
+            "END": END,
+        },
+    )
+
+    # â”€â”€ Every worker node feeds back into the supervisor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    _worker_nodes = [
+        "research_retrieval",
+        "literature_review",
+        "citation_verification",
+        "gap_analysis",
+        "methodology_suggestion",
+        "draft_writing",
+        "hallucination_detection",
+        "formatting",
+        "journal_recommendation",
+        "reviewer_simulation",
+        "submission_preparation",
+    ]
+    for node_name in _worker_nodes:
+        workflow.add_edge(node_name, "supervisor")
+
+    # â”€â”€ Compile with checkpointer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    checkpointer = MemorySaver()
+    compiled = workflow.compile(checkpointer=checkpointer)
+
+    logger.info("graph.compiled", node_count=len(_worker_nodes) + 1)
+    return compiled
+
+
+async def _supervisor_node(state: ResearchState) -> dict[str, Any]:
+    """Thin pass-through node used as the routing hub.
+
+    The actual routing logic is in ``supervisor.route`` and is wired via
+    ``add_conditional_edges``.  This node just logs the transition.
+    """
+    logger.debug(
+        "supervisor.enter",
+        current_agent=state.get("current_agent"),
+        status=state.get("status"),
+        project_id=state.get("project_id"),
+    )
+    return {"current_agent": "supervisor"}
+
+
+# â”€â”€ Convenience runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+async def run_workflow(
+    topic: str,
+    project_id: str,
+    *,
+    user_preferences: dict[str, Any] | None = None,
+    max_revisions: int = 3,
+    format_style: str = "ieee",
+) -> ResearchState:
+    """Run the full research workflow end-to-end.
+
+    This is a high-level convenience function intended for services and
+    CLI scripts.  It builds the graph, prepares the initial state, and
+    invokes the compiled graph asynchronously.
+
+    Args:
+        topic: The user's research topic / question.
+        project_id: UUID of the owning project.
+        user_preferences: Optional dict of user preferences.
+        max_revisions: Maximum number of revision loops (default 3).
+        format_style: Target formatting style (default ``"ieee"``).
+
+    Returns:
+        The final ``ResearchState`` after the workflow completes.
+    """
+    workflow_start_ns = time.monotonic_ns()
+    logger.info(
+        "workflow.start",
+        topic=topic,
+        project_id=project_id,
+        max_revisions=max_revisions,
+    )
+
+    graph = build_research_graph()
+
+    initial_state: dict[str, Any] = {
+        "topic": topic,
+        "project_id": project_id,
+        "user_preferences": user_preferences or {},
+        "retrieved_papers": [],
+        "paper_embeddings_stored": False,
+        "literature_review": "",
+        "key_themes": [],
+        "citations": [],
+        "citation_verification_results": [],
+        "research_gaps": [],
+        "suggested_methodologies": [],
+        "selected_methodology": None,
+        "paper_outline": {},
+        "paper_sections": {},
+        "hallucination_report": {},
+        "formatted_paper": "",
+        "format_style": format_style,
+        "journal_recommendations": [],
+        "reviewer_feedback": [],
+        "submission_package": {},
+        "current_agent": "",
+        "agent_history": [],
+        "errors": [],
+        "status": "initialized",
+        "messages": [],
+        "revision_count": 0,
+        "max_revisions": max_revisions,
+    }
+
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        # Publish workflow start event
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="supervisor",
+                    event_type="workflow_started",
+                    project_id=project_id,
+                    data={"topic": topic, "format_style": format_style},
+                )
+            )
+        except Exception:
+            pass
+
+        final_state = await graph.ainvoke(initial_state, config=config)
+        workflow_duration_ms = (
+            time.monotonic_ns() - workflow_start_ns
+        ) / 1_000_000
+        
+        # Publish workflow completion event
+        try:
+            bus = EventBus()
+
+    
+            await bus.publish(
+                AgentEvent(
+                     agent_name="supervisor",
+                     event_type="workflow_completed",
+                     project_id=project_id,
+                     data={
+                           "status": final_state.get("status"),
+                           "agents_executed": len(
+                                      final_state.get("agent_history", [])
+                            ),
+                            "workflow_duration_ms": round(
+                                      workflow_duration_ms,
+                                           2,
+                            ),
+                        },
+                    )
+                )
+
+        except Exception:
+             pass
+
+        logger.info(
+            "workflow.complete",
+            project_id=project_id,
+            status=final_state.get("status"),
+            agents_executed=len(final_state.get("agent_history", [])),
+        )
+        return final_state  # type: ignore[return-value]
+
+    except Exception as exc:
+        logger.error(
+            "workflow.failed",
+            project_id=project_id,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        raise
+
+============================================================
+FILE: backend\app\services\research_service.py
+============================================================
+"""Research workflow orchestration service.
+
+Manages the lifecycle of a LangGraph research workflow:
+start, pause, resume, cancel, and status queries.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+import datetime as _dt
+from typing import Any
+import traceback
+from app.agents.graph import build_research_graph, run_workflow
+from app.core.events import EventBus, AgentEvent
+from app.core.exceptions import NotFoundError, WorkflowError
+from app.models.database import Project, get_async_session
+from app.models.schemas import ResearchStartRequest, ResearchStatusResponse
+from app.services.project_service import ProjectService
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+# â”€â”€ In-memory workflow registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Maps project_id â†’ workflow metadata.  In production, replace with
+# Redis or a proper task queue (Celery, ARQ, etc.).
+
+_active_workflows: dict[str, dict[str, Any]] = {}
+
+
+class ResearchService:
+    """Orchestrates the multi-agent research workflow lifecycle."""
+
+    # â”€â”€ START â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    @staticmethod
+    async def start_research(
+        project_id: str,
+        request: ResearchStartRequest,
+    ) -> str:
+        """Launch a new research workflow as a background task.
+
+        Args:
+            project_id: UUID of the owning project.
+            request: The research start request payload containing topic
+                and optional preferences.
+
+        Returns:
+            A unique ``workflow_id`` string.
+
+        Raises:
+            NotFoundError: If the project does not exist.
+            WorkflowError: If a workflow is already running for this project.
+        """
+        # Validate project exists
+        project = await ProjectService.get_project(project_id)
+        topic = (
+           request.search_queries[0]
+           if getattr(request, "search_queries", None)
+           else project.topic or ""
+        )
+
+        # Prevent duplicate workflows
+        if project_id in _active_workflows:
+            existing = _active_workflows[project_id]
+            if existing.get("status") in ("running", "paused"):
+                raise WorkflowError(
+                    f"A workflow is already {existing['status']} for project "
+                    f"{project_id}. Cancel it first."
+                )
+
+        workflow_id = str(uuid.uuid4())
+
+        # Register the workflow
+        _active_workflows[project_id] = {
+            "workflow_id": workflow_id,
+            "project_id": project_id,
+            "topic": topic,
+            "status": "running",
+            "started_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "task": None,
+            "cancel_event": asyncio.Event(),
+            "current_agent": "research_retrieval",
+            "progress_pct": 0.0,
+        }
+
+
+        # Update project status
+        async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+            proj = result.scalar_one_or_none()
+            if proj is not None:
+                proj.status = "researching"
+                proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+                await session.commit()
+
+        # Publish start event
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_started",
+                    project_id=project_id,
+                    data={
+                        "workflow_id": workflow_id,
+                        "topic": project.topic or "",
+                    },
+                )
+            )
+        except Exception:
+            logger.warning("research_service.event_publish_failed")
+
+        # Launch as background task
+        task = asyncio.create_task(
+            _run_workflow_task(
+                workflow_id=workflow_id,
+
+                project_id=project_id,
+                topic=topic,
+                user_preferences=getattr(request, "user_preferences", None) or {},
+                max_revisions=getattr(request, "max_revisions", 3),
+                format_style=getattr(request, "format_style", "ieee"),
+            )
+        )
+        _active_workflows[project_id]["task"] = task
+
+        logger.info(
+            "research_service.started",
+            project_id=project_id,
+            workflow_id=workflow_id,
+            topic=topic,
+        )
+        return workflow_id
+
+    # â”€â”€ STATUS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    @staticmethod
+    async def get_research_status(project_id: str) -> ResearchStatusResponse:
+        """Get the current status of a project's research workflow.
+
+        Args:
+            project_id: UUID of the project.
+
+        Returns:
+            A ``ResearchStatusResponse`` with current state information.
+
+        Raises:
+            NotFoundError: If no workflow has been started for this project.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow found for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        return ResearchStatusResponse(
+            project_id=project_id,
+            status=wf.get("status", "unknown"),
+            started_at=wf.get("started_at"),
+            current_agent=wf.get("current_agent"),
+            progress_pct=wf.get("progress_pct", 0.0),
+            completed_at=wf.get("completed_at"),
+            error=wf.get("error"),
+        )
+
+    # â”€â”€ PAUSE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    @staticmethod
+    async def pause_research(project_id: str) -> None:
+        """Pause a running research workflow.
+
+        The current node will finish execution, but no new nodes will be
+        dispatched until ``resume_research`` is called.
+
+        Args:
+            project_id: UUID of the project.
+
+        Raises:
+            NotFoundError: If no workflow is active.
+            WorkflowError: If the workflow is not in a pausable state.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        if wf["status"] != "running":
+            raise WorkflowError(
+                f"Cannot pause workflow in state '{wf['status']}'"
+            )
+
+        wf["status"] = "paused"
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_paused",
+                    project_id=project_id,
+                    data={"workflow_id": wf["workflow_id"]},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.paused",
+            project_id=project_id,
+            workflow_id=wf["workflow_id"],
+        )
+
+    # â”€â”€ RESUME â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    @staticmethod
+    async def resume_research(project_id: str) -> None:
+        """Resume a paused research workflow.
+
+        Args:
+            project_id: UUID of the project.
+
+        Raises:
+            NotFoundError: If no workflow is active.
+            WorkflowError: If the workflow is not paused.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        if wf["status"] != "paused":
+            raise WorkflowError(
+                f"Cannot resume workflow in state '{wf['status']}'"
+            )
+
+        wf["status"] = "running"
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_resumed",
+                    project_id=project_id,
+                    data={"workflow_id": wf["workflow_id"]},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.resumed",
+            project_id=project_id,
+            workflow_id=wf["workflow_id"],
+        )
+
+    # â”€â”€ CANCEL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    @staticmethod
+    async def cancel_research(project_id: str) -> None:
+        """Cancel a running or paused research workflow.
+
+        Args:
+            project_id: UUID of the project.
+
+        Raises:
+            NotFoundError: If no workflow is active.
+            WorkflowError: If the workflow has already completed.
+        """
+        if project_id not in _active_workflows:
+            raise NotFoundError(
+                f"No active workflow for project {project_id}"
+            )
+
+        wf = _active_workflows[project_id]
+        if wf["status"] in ("completed", "failed"):
+            raise WorkflowError(
+                f"Workflow already in terminal state '{wf['status']}'"
+            )
+
+        # Signal cancellation
+        cancel_event: asyncio.Event | None = wf.get("cancel_event")
+        if cancel_event:
+            cancel_event.set()
+
+        # Cancel the asyncio Task if running
+        task: asyncio.Task | None = wf.get("task")
+        if task and not task.done():
+            task.cancel()
+
+        wf["status"] = "cancelled"
+        wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        # Update project status
+        async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+            proj = result.scalar_one_or_none()
+            if proj is not None:
+                proj.status = "cancelled"
+                proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+                await session.commit()
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_cancelled",
+                    project_id=project_id,
+                    data={"workflow_id": wf["workflow_id"]},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.cancelled",
+            project_id=project_id,
+            workflow_id=wf["workflow_id"],
+        )
+
+
+# â”€â”€ Background task â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+async def _run_workflow_task(
+    *,
+    workflow_id: str,
+    project_id: str,
+    topic: str,
+    user_preferences: dict[str, Any],
+    max_revisions: int,
+    format_style: str,
+) -> None:
+    """Run the LangGraph workflow inside a background asyncio task.
+
+    Updates the in-memory workflow registry with status transitions and
+    persists the final project status to the database.
+    """
+    try:
+        logger.info(
+            "research_service.task_started",
+            workflow_id=workflow_id,
+            project_id=project_id,
+        )
+
+        final_state = await run_workflow(
+            topic=topic,
+            project_id=project_id,
+            user_preferences=user_preferences,
+            max_revisions=max_revisions,
+            format_style=format_style,
+        )
+
+        # Update workflow metadata
+        if project_id in _active_workflows:
+            wf = _active_workflows[project_id]
+            wf["status"] = "completed"
+            wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            wf["current_agent"] = final_state.get("current_agent", "")
+
+        # Update project status
+        async with get_async_session() as session:
+            # pyrefly: ignore [missing-import]
+            from sqlalchemy import select
+
+            result = await session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+            proj = result.scalar_one_or_none()
+            if proj is not None:
+                proj.status = "completed"
+
+                logger.info(
+                    "final_state_type",
+                    type=str(type(final_state)),
+                )
+                
+                proj.workflow_state = final_state
+                proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+
+                logger.info(
+                    "research_service.saving_workflow_state",
+                    project_id=project_id,
+                    keys=list(final_state.keys()),
+                )
+
+                sections = final_state.get("paper_sections", {})
+
+                if sections:
+                    from sqlalchemy import delete
+                    from app.models.database import DocumentSection
+
+                    await session.execute(
+                        delete(DocumentSection).where(
+                            DocumentSection.project_id == project_id
+                        )
+                    )
+
+                    for order, (title, content) in enumerate(sections.items()):
+                        session.add(
+                            DocumentSection(
+                                project_id=project_id,
+                                title=title,
+                                content=content,
+                section_order=order,
+                section_type=title.lower().replace(" ", "_"),
+                word_count=len(content.split()) if content else 0,
+            )
+        )
+
+        logger.info(
+            "research_service.saved_document_sections",
+            project_id=project_id,
+            section_count=len(sections),
+        )
+
+
+        await session.commit()
+
+            
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_completed",
+                    project_id=project_id,
+                    data={"workflow_id": workflow_id},
+                )
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            "research_service.task_completed",
+            workflow_id=workflow_id,
+            project_id=project_id,
+        )
+
+    except asyncio.CancelledError:
+        logger.warning(
+            "research_service.task_cancelled",
+            workflow_id=workflow_id,
+            project_id=project_id,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "research_service.task_failed",
+            workflow_id=workflow_id,
+            project_id=project_id,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+
+        if project_id in _active_workflows:
+            wf = _active_workflows[project_id]
+            wf["status"] = "failed"
+            wf["error"] = str(exc)
+            wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        # Update project status
+        try:
+            async with get_async_session() as session:
+                # pyrefly: ignore [missing-import]
+                from sqlalchemy import select
+
+                result = await session.execute(
+                    select(Project).where(Project.id == project_id)
+                )
+                proj = result.scalar_one_or_none()
+                if proj is not None:
+                    proj.status = "failed"
+                    proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+                    await session.commit()
+        except Exception:
+            pass
+
+        try:
+            bus = EventBus()
+            await bus.publish(
+                AgentEvent(
+                    agent_name="system",
+                    event_type="workflow_failed",
+                    project_id=project_id,
+                    data={
+                        "workflow_id": workflow_id,
+                        "error": str(exc),
+                    },
+                )
+            )
+        except Exception:
+            pass
+
+============================================================
+FILE: backend\app\api\v1\research.py
+============================================================
+"""
+ResearchOS â€” Research Workflow API Endpoints
+
+Endpoints for starting, monitoring, pausing, resuming, and cancelling
+multi-agent research workflows.
+"""
+
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.dependencies import get_db
+from app.services.research_service import ResearchService
+from app.models.schemas import (
+    ResearchStartRequest,
+    ResearchStatusResponse,
+)
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+router = APIRouter()
+
+
+@router.post("/start", response_model=ResearchStatusResponse)
+async def start_research(
+    project_id: str,
+    request: ResearchStartRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Start a multi-agent research workflow for a project.
+
+    This launches the LangGraph supervisor workflow as a background task.
+    The workflow executes all agents sequentially (retrieval â†’ review â†’
+    gaps â†’ methodology â†’ drafting â†’ verification â†’ formatting â†’ submission).
+
+    Use the WebSocket endpoint or GET /status to monitor progress.
+    """
+    try:
+        workflow_id = await ResearchService.start_research(
+            project_id=project_id,
+            request=request,
+        )
+        logger.info(
+            "research_workflow_started",
+            project_id=project_id,
+            workflow_id=workflow_id,
+        )
+        return await ResearchService.get_research_status(project_id)
+    except Exception as e:
+        logger.error(
+            "research_start_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to start research: {e}")
+
+
+@router.get("/status", response_model=ResearchStatusResponse)
+async def get_research_status(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get the current status of a research workflow.
+
+    Returns the current agent, overall progress, agent history,
+    and any errors encountered.
+    """
+    try:
+        return await ResearchService.get_research_status(project_id)
+    except Exception as e:
+        logger.error(
+            "research_status_fetch_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=404, detail=f"Research status not found: {e}")
+
+
+@router.post("/pause")
+async def pause_research(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pause a running research workflow.
+
+    The workflow can be resumed later from the last checkpoint.
+    Currently in-progress agent tasks will complete before pausing.
+    """
+    try:
+        await ResearchService.pause_research(project_id)
+        logger.info("research_workflow_paused", project_id=project_id)
+        return {"status": "paused", "project_id": project_id}
+    except Exception as e:
+        logger.error(
+            "research_pause_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to pause: {e}")
+
+
+@router.post("/resume")
+async def resume_research(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Resume a paused research workflow from the last checkpoint.
+    """
+    try:
+        await ResearchService.resume_research(project_id)
+        logger.info("research_workflow_resumed", project_id=project_id)
+        return {"status": "resumed", "project_id": project_id}
+    except Exception as e:
+        logger.error(
+            "research_resume_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to resume: {e}")
+
+
+@router.post("/cancel")
+async def cancel_research(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cancel a running or paused research workflow.
+
+    This is irreversible. All intermediate results are preserved
+    but the workflow cannot be resumed.
+    """
+    try:
+        await ResearchService.cancel_research(project_id)
+        logger.info("research_workflow_cancelled", project_id=project_id)
+        return {"status": "cancelled", "project_id": project_id}
+    except Exception as e:
+        logger.error(
+            "research_cancel_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to cancel: {e}")

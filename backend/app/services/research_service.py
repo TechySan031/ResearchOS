@@ -118,17 +118,17 @@ class ResearchService:
             logger.warning("research_service.event_publish_failed")
 
         # Launch as background task
+       
+        
         task = asyncio.create_task(
             _run_workflow_task(
-                workflow_id=workflow_id,
-
-                project_id=project_id,
-                topic=topic,
-                user_preferences=getattr(request, "user_preferences", None) or {},
-                max_revisions=getattr(request, "max_revisions", 3),
-                format_style=getattr(request, "format_style", "ieee"),
-            )
-        )
+             workflow_id=workflow_id,
+            project_id=project_id,
+            topic=topic,
+            user_preferences=getattr(request, "user_preferences", None) or {},
+            max_revisions=getattr(request, "max_revisions", 3),
+            format_style=getattr(request, "format_style", "ieee"),
+        ))
         _active_workflows[project_id]["task"] = task
 
         logger.info(
@@ -358,21 +358,158 @@ async def _run_workflow_task(
             project_id=project_id,
         )
 
-        final_state = await run_workflow(
-            topic=topic,
-            project_id=project_id,
-            user_preferences=user_preferences,
-            max_revisions=max_revisions,
-            format_style=format_style,
-        )
+        graph = build_research_graph()
+
+        initial_state = {
+            "topic": topic,
+            "project_id": project_id,
+            "user_preferences": user_preferences,
+            "retrieved_papers": [],
+            "paper_embeddings_stored": False,
+            "literature_review": "",
+            "key_themes": [],
+            "citations": [],
+            "citation_verification_results": [],
+            "research_gaps": [],
+            "suggested_methodologies": [],
+            "selected_methodology": None,
+            "paper_outline": {},
+            "paper_sections": {},
+            "hallucination_report": {},
+            "formatted_paper": "",
+            "format_style": format_style,
+            "journal_recommendations": [],
+            "reviewer_feedback": [],
+            "submission_package": {},
+            "current_agent": "",
+            "agent_history": [],
+            "errors": [],
+            "status": "initialized",
+            "messages": [],
+            "revision_count": 0,
+            "max_revisions": max_revisions,
+        }
+
+        config = {
+            "configurable": {
+                "thread_id": project_id
+            }
+        }
 
         # Update workflow metadata
+        final_state = None
+
+        WORKFLOW_ORDER = [
+            "research_retrieval",
+            "literature_review",
+            "citation_verification",
+            "gap_analysis",
+            "methodology_suggestion",
+            "draft_writing",
+            "hallucination_detection",
+            "formatting",
+            "journal_recommendation",
+            "reviewer_simulation",
+            "submission_preparation",
+        ]
+
+        async for state in graph.astream(initial_state, config=config):
+
+            # DEBUG: See exactly what LangGraph is yielding
+            logger.info(
+                "LANGGRAPH_STREAM",
+                keys=list(state.keys()),
+            )
+
+            node_name = next(iter(state.keys()))
+            node_state = state[node_name]
+
+            final_state = node_state
+
+            logger.info(
+                "workflow.node_finished",
+                node=node_name,
+            )
+
+            # Ignore supervisor and any non-worker nodes
+            if node_name in WORKFLOW_ORDER:
+
+                # Update active workflow registry
+                _active_workflows[project_id]["current_agent"] = node_name
+
+                _active_workflows[project_id]["progress_pct"] = (
+                    (WORKFLOW_ORDER.index(node_name) + 1)
+                    / len(WORKFLOW_ORDER)
+                ) * 100
+
+                bus = EventBus()
+
+                # Send workflow status update
+                try:
+                    await bus.publish(
+                        AgentEvent(
+                            agent_name="system",
+                            event_type="workflow_status",
+                            project_id=project_id,
+                            data={
+                                "status": "running",
+                                "current_agent": node_name,
+                                "progress": _active_workflows[project_id]["progress_pct"],
+                            },
+                        )
+                    )
+                except Exception:
+                    pass
+
+                # Notify frontend that this agent completed
+                try:
+                    await bus.publish(
+                        AgentEvent(
+                            agent_name=node_name,
+                            event_type="agent_completed",
+                            project_id=project_id,
+                            data={
+                                "current_agent": node_name,
+                                "progress_pct": _active_workflows[project_id]["progress_pct"],
+                            },
+                        )
+                    )
+                except Exception:
+                    pass
+
+
+        if final_state is None:
+            raise RuntimeError("Workflow produced no final state")
+
         if project_id in _active_workflows:
             wf = _active_workflows[project_id]
-            wf["status"] = "completed"
-            wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            wf["current_agent"] = final_state.get("current_agent", "")
 
+            wf["status"] = "completed"
+            wf["progress_pct"] = 100
+            wf["completed_at"] = _dt.datetime.now(
+                _dt.timezone.utc
+            ).isoformat()
+
+            wf["current_agent"] = ""
+
+            bus = EventBus()
+
+            try:
+                await bus.publish(
+                    AgentEvent(
+                        agent_name="system",
+                        event_type="workflow_status",
+                        project_id=project_id,
+                        data={
+                        "status": "completed",
+                        "current_agent": final_state.get("current_agent", ""),
+                        "progress": 100,
+                    },
+                )
+            )
+            except Exception:
+                pass
+    
         # Update project status
         async with get_async_session() as session:
             # pyrefly: ignore [missing-import]
@@ -417,40 +554,40 @@ async def _run_workflow_task(
                                 project_id=project_id,
                                 title=title,
                                 content=content,
-                section_order=order,
-                section_type=title.lower().replace(" ", "_"),
-                word_count=len(content.split()) if content else 0,
-            )
-        )
+                                section_order=order,
+                                section_type=title.lower().replace(" ", "_"),
+                                word_count=len(content.split()) if content else 0,
+                            )
+                        )
 
-        logger.info(
-            "research_service.saved_document_sections",
-            project_id=project_id,
-            section_count=len(sections),
-        )
+                    logger.info(
+                        "research_service.saved_document_sections",
+                        project_id=project_id,
+                        section_count=len(sections),
+                    )
 
 
-        await session.commit()
+                    await session.commit()
 
             
-        try:
-            bus = EventBus()
-            await bus.publish(
-                AgentEvent(
-                    agent_name="system",
-                    event_type="workflow_completed",
-                    project_id=project_id,
-                    data={"workflow_id": workflow_id},
-                )
-            )
-        except Exception:
-            pass
+                    try:
+                        bus = EventBus()
+                        await bus.publish(
+                            AgentEvent(
+                                agent_name="system",
+                                event_type="workflow_completed",
+                                project_id=project_id,
+                                data={"workflow_id": workflow_id},
+                            )
+                        )
+                    except Exception:
+                        pass
 
-        logger.info(
-            "research_service.task_completed",
-            workflow_id=workflow_id,
-            project_id=project_id,
-        )
+                    logger.info(
+                        "research_service.task_completed",
+                        workflow_id=workflow_id,
+                        project_id=project_id,
+                    )
 
     except asyncio.CancelledError:
         logger.warning(
@@ -465,38 +602,38 @@ async def _run_workflow_task(
             workflow_id=workflow_id,
             project_id=project_id,
             error=str(exc),
-            traceback=traceback.format_exc(),
-        )
+                    traceback=traceback.format_exc(),
+                )
 
         if project_id in _active_workflows:
-            wf = _active_workflows[project_id]
-            wf["status"] = "failed"
-            wf["error"] = str(exc)
-            wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                wf = _active_workflows[project_id]
+                wf["status"] = "failed"
+                wf["error"] = str(exc)
+                wf["completed_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
 
-        # Update project status
+            # Update project status
         try:
             async with get_async_session() as session:
-                # pyrefly: ignore [missing-import]
+            # pyrefly: ignore [missing-import]
                 from sqlalchemy import select
 
                 result = await session.execute(
                     select(Project).where(Project.id == project_id)
                 )
                 proj = result.scalar_one_or_none()
-                if proj is not None:
-                    proj.status = "failed"
-                    proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
-                    await session.commit()
+            if proj is not None:
+                proj.status = "failed"
+                proj.updated_at = _dt.datetime.now(_dt.timezone.utc)
+                await session.commit()
         except Exception:
             pass
 
-        try:
-            bus = EventBus()
-            await bus.publish(
-                AgentEvent(
-                    agent_name="system",
-                    event_type="workflow_failed",
+    try:
+        bus = EventBus()
+        await bus.publish(
+            AgentEvent(
+                agent_name="system",
+                event_type="workflow_failed",
                     project_id=project_id,
                     data={
                         "workflow_id": workflow_id,
@@ -504,5 +641,6 @@ async def _run_workflow_task(
                     },
                 )
             )
-        except Exception:
-            pass
+    except Exception:
+        pass
+
