@@ -67,7 +67,7 @@ class EmbeddingGenerator:
                 return
 
             settings = get_settings()
-            self._model_name = settings.embedding_model or "BAAI/bge-large-en-v1.5"
+            self._model_name = settings.embedding_model or "BAAI/bge-small-en-v1.5"
             device = settings.embedding_device or "cpu"
             self._dimension = int(settings.embedding_dimension or 1024)
 
@@ -82,10 +82,11 @@ class EmbeddingGenerator:
             try:
                 from sentence_transformers import SentenceTransformer
 
-                self._model = await asyncio.to_thread(
-                    SentenceTransformer,
-                    self._model_name,
-                    device=device,
+                self.model = await asyncio.to_thread(
+                    lambda: SentenceTransformer(
+                        self.model_name,
+                        device=device,
+                    )
                 )
                 duration = time.perf_counter() - start_time
                 logger.info(

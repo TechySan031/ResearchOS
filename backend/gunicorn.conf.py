@@ -11,7 +11,8 @@ import os
 # ---------------------------------------------------------------------------
 # Server socket
 # ---------------------------------------------------------------------------
-bind = os.getenv("GUNICORN_BIND", "0.0.0.0:8000")
+port = os.getenv("PORT", "8000")
+bind = f"0.0.0.0:{port}"
 
 # ---------------------------------------------------------------------------
 # Worker processes
@@ -19,7 +20,7 @@ bind = os.getenv("GUNICORN_BIND", "0.0.0.0:8000")
 # Formula: min(cpu_count * 2 + 1, 4)  —  capped at 4 so the container
 # doesn't over-subscribe in constrained environments (k8s / compose limits).
 _cpu_workers = multiprocessing.cpu_count() * 2 + 1
-workers = int(os.getenv("GUNICORN_WORKERS", min(_cpu_workers, 4)))
+workers = int(os.getenv("GUNICORN_WORKERS", "1")) 
 worker_class = "uvicorn.workers.UvicornWorker"
 
 # ---------------------------------------------------------------------------

@@ -37,8 +37,7 @@ LABEL maintainer="ResearchOS Team" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_ENV=production \
-    APP_PORT=8000 \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" 
 
 # Install only the minimal runtime libraries (libpq for asyncpg)
 RUN apt-get update && \
@@ -64,13 +63,12 @@ COPY --chown=appuser:appuser . .
 USER appuser
 
 # Pre-download the embedding models so they are cached in the image
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-en-v1.5'); SentenceTransformer('BAAI/bge-small-en-v1.5')"
-
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
 EXPOSE 8000
 
 # Health check — hit the /health endpoint every 30 s
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD ["curl", "-f", "http://localhost:8000/health"]
+    CMD sh -c "curl -f http://localhost:${PORT:-8000}/health || exit 1"
 
 # Launch with Gunicorn + Uvicorn workers (config file baked in)
 CMD ["gunicorn", "app.main:app", "-c", "gunicorn.conf.py"]
