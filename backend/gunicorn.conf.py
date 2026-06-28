@@ -5,7 +5,6 @@ Optimised for a FastAPI application served behind a reverse proxy.
 Uses UvicornWorker for async request handling.
 """
 
-import multiprocessing
 import os
 
 # ---------------------------------------------------------------------------
@@ -17,10 +16,8 @@ bind = f"0.0.0.0:{port}"
 # ---------------------------------------------------------------------------
 # Worker processes
 # ---------------------------------------------------------------------------
-# Formula: min(cpu_count * 2 + 1, 4)  —  capped at 4 so the container
-# doesn't over-subscribe in constrained environments (k8s / compose limits).
-_cpu_workers = multiprocessing.cpu_count() * 2 + 1
-workers = int(os.getenv("GUNICORN_WORKERS", "1")) 
+
+workers = 1
 worker_class = "uvicorn.workers.UvicornWorker"
 
 # ---------------------------------------------------------------------------
